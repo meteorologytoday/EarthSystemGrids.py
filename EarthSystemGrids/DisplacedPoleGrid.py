@@ -72,7 +72,58 @@ def I_curve_ray_tracing_system(
     variables,
     FG_funcs,
 ):
+    """
+    Right-hand side of the ODE that traces a single I-curve (mesh meridian).
 
+    The mesh parallels (J-curves) are the zero level sets of the potential
+
+        (1) phi(x, y, v) = x^2 + y^2 - ( f(v) + g(v) ) y + f(v) g(v)
+
+    where f and g are functions of the pseudo-latitude v. The J-curve labelled
+    by v is therefore
+
+        (2) phi(x, y, v) = 0
+
+    For a fixed v, (2) is a level set of phi, so the gradient
+
+            grad phi = ( 2x , 2y - (f+g) )
+
+    is normal to that J-curve. An I-curve must cross every J-curve at a right
+    angle, so its tangent is parallel to grad phi,
+
+        (3) (dx/dv, dy/dv) = m * grad phi
+
+    for some scalar m = m(v) yet to be determined.
+
+    # Finding m
+
+    A point riding the moving contour stays on it for every v, so the TOTAL
+    derivative of (2) along the trajectory vanishes,
+
+        (4) grad phi dot (dx/dv, dy/dv)  +  d_v phi = 0
+
+    where d_v phi is the PARTIAL derivative taken at frozen (x, y). Substituting
+    (3) into (4) gives m |grad phi|^2 + d_v phi = 0, hence
+
+        (5) m = - d_v phi / |grad phi|^2
+
+    # The ray-tracing system
+
+        (6) (dx/dv, dy/dv) = - d_v phi / |grad phi|^2 * ( 2x , 2y - (f+g) )
+
+            |grad phi|^2   = 4 x^2 + ( 2y - (f+g) )^2
+
+    Integrating (6) in v, from a starting point on the equator circle, produces
+    the complete I-curve.
+
+    # Notes
+
+    Degeneracy. |grad phi|^2 vanishes only at x = 0, y = (f+g)/2, the centre of
+    the circle. That point lies ON the circle only when the radius is zero, i.e.
+    at the mesh north pole. Boundary conditions that close the pole exactly,
+    f(90deg) = g(90deg), therefore make (6) a 0/0 on the last row, and the
+    integration has to stop short of v_max.
+    """
     x, y = variables
 
     f = FG_funcs.f(v)
