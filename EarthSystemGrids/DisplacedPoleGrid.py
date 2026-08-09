@@ -1,13 +1,24 @@
 import numpy as np
 import functools
 
+def spherical_to_stereo(lon:float, lat:float):
+    """
+    Project sphere coordinate to stereographic.
+    Unit circle means equator, and center means northpole.
+    """
+    rho = np.tan(np.pi/4 - lat/2)
+    x = rho * np.cos(lon)
+    y = rho * np.sin(lon)
+    return x, y
+
+
 def project_stereo_to_sphere(x:float, y:float):
     """
     Project stereographic coordinate back to sphere coordinate.
     Unit circle means equator, and center means northpole.
     """
-    lon = np.rad2deg(np.arctan2(y, x))
-    lat = np.rad2deg(np.pi / 2.0 - 2 * np.arctan((x**2 + y**2)**0.5))
+    lon = np.arctan2(y, x)
+    lat = np.pi / 2.0 - 2 * np.arctan((x**2 + y**2)**0.5)
 
     return lon, lat
 
@@ -21,8 +32,8 @@ def spherical_to_cartesian(
     Convert from spherical coordinate to lonlat
     The 0th axis is (x, y, z), the 1st axis is the points
     """
-    lon = np.deg2rad(r_sphere[lon_idx, :])
-    lat = np.deg2rad(r_sphere[lat_idx, :])
+    lon = r_sphere[lon_idx, :]
+    lat = r_sphere[lat_idx, :]
     x = r * np.cos(lat) * np.cos(lon)
     y = r * np.cos(lat) * np.sin(lon)
     z = r * np.sin(lat)
@@ -161,9 +172,9 @@ def _logcosh(x):
 
 
 def beta(
-    v: float,
-    v_transition: float,
-    dv_transition_width: float,
+    v: float,                  # [rad]
+    v_transition: float,       # [rad]
+    dv_transition_width: float,# [rad]
 ):
     """
     Base shape function for building f and g: a smooth, odd, monotonically
@@ -321,13 +332,13 @@ class DisplacedPoleGrid:
         Unknowns: A0, A1, B0, B1, W^f_trop, W^f_polar, and W^g_polar.
         Boundary conditions:
             
-            (1) f(0) = -1
-            (2) g(0) =  1
-            (3) df/dv(0) =   s_0
-            (4) dg/dv(0) = - s_0
+            (1) f(0) = -1         => A0 = -1
+            (2) g(0) =  1         => B0 =  1
+            (3) df/dv(v_trop) =   s_trop
+            (4) dg/dv(v_trop) = - s_trop
             (5) f(90deg) = y_np
             (6) g(90deg) = y_np
-            (7) f'(v_max) = s_f
+            (7) f'(v_polar) = s_polar
 
     where s_0 and s_g is the resolution at the equator and the maximum latitude of the grid,
     and y_np being the y location of the displaced north pole.
@@ -360,84 +371,111 @@ class DisplacedPoleGrid:
    
     def __init__(
         self,
-        displaced_north_pole_lat: float, # [deg]
-        displaced_north_pole_lon: float, # [deg]
-        dfdv_v_transition_tropics: float, # [deg]
-        dfdv_v_transition_width_tropics: float, # [deg]
-        dfdv_v_transition_polar: float, # [deg]
-        dfdv_v_transition_width_polar: float,
-        dgdv_v_transition: float, # [deg]
-        dgdv_v_transition_width: float, # [deg]
-        number_of_rows_in_northern_hemisphere: int,
-        number_of_rows_in_southern_hemisphere: int,
+        displaced_north_pole_lat: float, # [rad]
+        v_trans_tropics_f: float,         # [rad]
+        v_trans_width_tropics_f: float,   # [rad]
+        v_trans_polar_f: float,          # [rad]
+        v_trans_width_polar_f: float,    # [rad]
+        v_trans_g: float,                # [rad]
+        v_trans_g_width: float,          # [rad]
+        resolution_equator: float,       # [rad/grid]
+        resolution_polar: float,         # [rad/grid] the resolution of the point speficied by resolution_polar_v
+        resolution_polar_v: float,       # [rad] location of a high latitude point
+        number_of_rows: int,
         number_of_columns: int,
     ):
         self.displaced_north_pole_lat = displaced_north_pole_lat 
-        self.displaced_north_pole_lon = displaced_north_pole_lon 
-        self.dfdv_v_transition_tropics = dfdv_v_transition_tropics
-        self.dfdv_v_transition_width_tropics = dfdv_v_transition_width_tropics
-        self.dfdv_v_transition_polar = dfdv_v_transition_polar
-        self.dfdv_v_transition_width_polar = dfdv_v_transition_width_polar
-        self.dgdv_v_transition = dgdv_v_transition
-        self.dgdv_v_transition_width = dgdv_v_transition_width
-        self.dfdv_amp_tropics = dfdj_amp_tropics
-        self.dfdv_amp_polar = dfdj_amp_polar
-        self.dgdv_amp = dgdj_amp
-        self.number_of_rows_in_northern_hemisphere = number_of_rows_in_northern_hemisphere
-        self.number_of_rows_in_southern_hemisphere = number_of_rows_in_southern_hemisphere
+        self.v_trans_tropics_f = v_trans_tropics_f
+        self.v_trans_width_tropics_f = v_trans_width_tropics_f
+        self.v_trans_polar_f = v_trans_polar_f
+        self.v_trans_width_polar_f = v_trans_width_polar_f
+        self.v_trans_g = v_trans_g
+        self.v_trans_g_width = v_trans_g_width
+        self.number_of_rows = number_of_rows
         self.number_of_columns = number_of_columns
        
-        self.v_bounds = np.concatenate((
-            np.linspace(-90.0, 0.0, number_of_rows_in_southern_hemisphere+1),
-            np.linspace(0, 90.0, number_of_rows_in_southern_hemisphere+1)[1:],
-        ))
-        self.j_eq = number_of_rows_in_southern_hemisphere 
-        def dvdj(j):
-            if j < self.number_of_rows_in_southern_hemisphere:
-                return 90.0 / number_of_rows_in_southern_hemisphere
-            else:
-                return 90.0 / number_of_rows_in_northern_hemisphere
-        
-        self.dvdj = dvdj
-        
-        self.A0 = 1.0 
-        self.A1 = 1.0
-        self.B0 = 1.0
-        self.B1 = 1.0
+        self.v_bounds = np.linspace(-np.pi/2, np.pi/2, number_of_rows+1)
+        self.dvdj = np.pi / number_of_rows
+    
+        self.solve_for_coefficients()
 
+    def f(self, v):
+        return -1.0 + self.A1 * v + (
+            - self.W_tropics_f * beta(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+            + self.W_polar_f * beta(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
+        )
 
     def dfdv(self, v):
         return self.A1 + (
-            - self.dfdv_amp_tropics * dbeta_dv(v, self.dfdv_v_transition_tropics, self.dfdv_v_transition_width_tropics)
-            + self.dfdv_amp_polar * dbeta_dv(v, self.dfdv_v_transition_polar, self.dfdv_v_transition_width_polar)
+            - self.W_tropics_f * dbeta_dv(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+            + self.W_polar_f * dbeta_dv(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
         )
 
     def dfdj(self, j):
         v = self.v_bounds[j]
         return self.dfdv(v) * self.dvdj(j)
 
-    def f(self, v):
-        return self.A0 + self.A1 * v + (
-            - self.dfdv_amp_tropics * beta(v, self.dfdv_v_transition_tropics, self.dfdv_v_transition_width_tropics)
-            + self.dfdv_amp_polar * beta(v, self.dfdv_v_transition_polar, self.dfdv_v_transition_width_polar)
-        )
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        else:
+            return 1.0 - self.B1 * v - (
+                self.W_g * beta(v, self.v_trans_g, self.v_trans_g_width)
+            )
 
     def dgdv(self, v):
         if v < 0:
             return - self.dfdv(v)
         else:
-            return self.B1 + (
-                self.dgdv_amp * dbeta_dv(v, self.dgdv_v_transition, self.dgdv_v_transition_width)
+            return - self.B1 - (
+                self.W_g * dbeta_dv(v, self.v_trans_g, self.v_trans_g_width)
             )
+
+    def grid_resolution_to_dgdv(
+        self,
+        grid_resolution: float, # [rad/grid]
+        g: float,               # dimensionless
+    ):
+        
+        return -0.5 * grid_resolution * np.sign(g) * (1 + g**2) / self.dvdj
+
+    def grid_resolution_to_dfdv(
+        self,
+        grid_resolution: float, # [rad/grid]
+        f: float,               # dimensionless
+    ):
+        # The way they are computed are identical        
+        return self.grid_resolution_to_dgdv(grid_resolution, f)
+
+
+    def solve_for_coefficients(self):
+        
+        s0 = self.grid_resolution_to_dfdv(self.resolution_equator, f=-1.0)
+        
+        # Solve for g's coefficients first
+        dbetadv_g = dbeta_dv(0.0, self.v_trans_g, self.v_trans_g_width)
+        beta_g = beta(np.pi/2, self.v_trans_g, self.v_trans_g_width)
+        _, y_NP = spherical_to_stereo(np.pi/2, self.displaced_north_pole_lat)
+
+        x = np.linalg.solve(
+            np.array([
+                [1,       dbetadv_g],
+                [np.pi/2, beta_g]
+            ]),
+            np.array([
+                s0,
+                1 - y_NP,
+            ])
+        )
+
+        self.B1 = x[0]
+        self.W_g = x[1]
+
+
+        # Then solve for f
+                
+              
  
-    def g(self, v):
-        if v < 0:
-            return - self.f(v)
-        else:
-            return self.B0 + self.B1 * v + (
-                self.dgdv_amp * beta(v, self.dgdv_v_transition, self.dgdv_v_transition_width)
-            )
-    
     def generate_J_curve(
         self,
         v: float,
@@ -447,7 +485,7 @@ class DisplacedPoleGrid:
         """
 
         pts = np.zeros((2, self.number_of_columns))
-        dh = np.deg2rad(360.0 / self.number_of_columns)
+        dh = 2*np.pi / self.number_of_columns
         
         h = 0.0 + np.arange(self.number_of_columns) * dh
 
@@ -478,11 +516,11 @@ class DisplacedPoleGrid:
         _I_curve_ray_tracing_system = functools.partial(I_curve_ray_tracing_system, FG_funcs=self)
 
         # initial point: on the equator
-        x0 = np.cos(np.deg2rad(u))
-        y0 = np.sin(np.deg2rad(u))
+        x0 = np.cos(u)
+        y0 = np.sin(u)
         number_of_grids = self.number_of_rows_in_northern_hemisphere
         integration_steps = number_of_grids * split 
-        dv = 90.0 / integration_steps
+        dv = np.pi/2 / integration_steps
         
         _, pts_xy = integrate_euler_forward(_I_curve_ray_tracing_system, 0.0, [x0, y0], dv, integration_steps)
 
@@ -496,15 +534,15 @@ class DisplacedPoleGrid:
 if __name__ == "__main__":
 
     displaced_pole_grid = DisplacedPoleGrid(
-        dfdv_v_transition_tropics = 20.0, # [deg]
-        dfdv_v_transition_width_tropics = 10.0, # [deg]
-        dfdj_amp_tropics = 1.04, # [radius/grid_index]
-        dfdv_v_transition_polar = 70.0, # [deg]
-        dfdv_v_transition_width_polar = 10.0,
-        dfdj_amp_polar = 1.0, # [radius/grid_index]
-        dgdv_v_transition: float, # [deg]
-        dgdv_v_transition_width: float, # [deg]
-        dgdj_amp: float, # [radius/grid_index]
+        v_trans_tropics_f = 20.0,         # [deg]
+        v_trans_width_tropics_f = 10.0,   # [deg]
+        amp_tropics_f = 1.04,             # [radius/grid_index]
+        v_trans_polar_f = 70.0,          # [deg]
+        v_trans_width_polar_f = 10.0,
+        amp_polar_f = 1.0, # [radius/grid_index]
+        v_trans_g: float, # [deg]
+        v_trans_g_width: float, # [deg]
+        amp_g: float, # [radius/grid_index]
         number_of_rows_in_northern_hemisphere: int,
         number_of_rows_in_southern_hemisphere: int,
         number_of_columns: int,
