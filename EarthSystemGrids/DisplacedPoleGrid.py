@@ -12,7 +12,7 @@ def spherical_to_stereo(lon:float, lat:float):
     return x, y
 
 
-def project_stereo_to_sphere(x:float, y:float):
+def stereo_to_spherical(x:float, y:float):
     """
     Project stereographic coordinate back to sphere coordinate.
     Unit circle means equator, and center means northpole.
@@ -381,7 +381,8 @@ class DisplacedPoleGrid:
         resolution_equator: float,       # [rad/grid]
         resolution_polar: float,         # [rad/grid] the resolution of the point speficied by resolution_polar_v
         resolution_polar_v: float,       # [rad] location of a high latitude point
-        number_of_rows: int,
+        number_of_rows_in_NH: int,
+        latitude_bounds_in_SH,           # An array of latitudes
         number_of_columns: int,
     ):
         self.displaced_north_pole_lat = displaced_north_pole_lat 
@@ -391,11 +392,14 @@ class DisplacedPoleGrid:
         self.v_trans_width_polar_f = v_trans_width_polar_f
         self.v_trans_g = v_trans_g
         self.v_trans_g_width = v_trans_g_width
-        self.number_of_rows = number_of_rows
+        self.resolution_equator = resolution_equator
+        self.resolution_polar = resolution_polar
+        self.resolution_polar_v = resolution_polar_v
+        self.number_of_rows_in_NH = number_of_rows_in_NH
         self.number_of_columns = number_of_columns
        
-        self.v_bounds = np.linspace(-np.pi/2, np.pi/2, number_of_rows+1)
-        self.dvdj = np.pi / number_of_rows
+        self.v_bounds = np.linspace(-np.pi/2, np.pi/2, number_of_rows_in_NH+1)
+        self.dvdj = np.pi / number_of_rows_in_NH
     
         self.solve_for_coefficients()
 
@@ -449,14 +453,19 @@ class DisplacedPoleGrid:
 
 
     def solve_for_coefficients(self):
-        
-        s0 = self.grid_resolution_to_dfdv(self.resolution_equator, f=-1.0)
+ 
+        _, y_NP   = spherical_to_stereo(np.pi/2, self.displaced_north_pole_lat)
+       
+        v_star = - np.abs(self.resolution_polar_v)
+        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
+       
+        s0    = self.grid_resolution_to_dfdv(self.resolution_equator, f=-1.0)
+        s_star = self.grid_resolution_to_dfdv(self.resolution_polar, f=y_star)
+
         
         # Solve for g's coefficients first
         dbetadv_g = dbeta_dv(0.0, self.v_trans_g, self.v_trans_g_width)
         beta_g = beta(np.pi/2, self.v_trans_g, self.v_trans_g_width)
-        _, y_NP = spherical_to_stereo(np.pi/2, self.displaced_north_pole_lat)
-
         x = np.linalg.solve(
             np.array([
                 [1,       dbetadv_g],
@@ -471,10 +480,31 @@ class DisplacedPoleGrid:
         self.B1 = x[0]
         self.W_g = x[1]
 
-
         # Then solve for f
-                
-              
+        dbetadv_polar_f_0     = dbeta_dv(0.0,        self.v_trans_polar_f, self.v_trans_width_polar_f)
+        dbetadv_polar_f_v_star = dbeta_dv(v_star, self.v_trans_polar_f, self.v_trans_width_polar_f)
+        dbetadv_tropics_f_0      = dbeta_dv(0.0,        self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+        dbetadv_tropics_f_v_star = dbeta_dv(v_star, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+        
+        beta_polar_f_NP    = beta(np.pi/2,    self.v_trans_polar_f, self.v_trans_width_polar_f)
+        beta_tropics_f_NP  = beta(np.pi/2,    self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+        
+        x = np.linalg.solve(
+            np.array([
+                [1,       dbetadv_polar_f_0,       - dbetadv_tropics_f_0    ],
+                [1,       dbetadv_polar_f_v_star,  - dbetadv_tropics_f_v_star],
+                [np.pi/2, beta_polar_f_NP,         - beta_tropics_f_NP   ],
+            ]),
+            np.array([
+                s0,
+                s_star,
+                1 + y_NP,
+            ])
+        )
+
+        self.A1          = x[0]
+        self.W_polar_f   = x[1]
+        self.W_tropics_f = x[2]
  
     def generate_J_curve(
         self,
@@ -486,19 +516,26 @@ class DisplacedPoleGrid:
 
         pts = np.zeros((2, self.number_of_columns))
         dh = 2*np.pi / self.number_of_columns
-        
         h = 0.0 + np.arange(self.number_of_columns) * dh
 
-        f = self.f(v)
-        g = self.g(v)
+        if v >= 0:
 
-        r   = (g - f) / 2.0
-        y_c = (g + f) / 2.0
+            f = self.f(v)
+            g = self.g(v)
 
-        x =       r * np.cos(h)
-        y = y_c + r * np.sin(h)
+            r   = (g - f) / 2.0
+            y_c = (g + f) / 2.0
+            
+            x =       r * np.cos(h)
+            y = y_c + r * np.sin(h)
 
-        lon, lat = project_stereo_to_sphere(x, y)
+            lon, lat = stereo_to_spherical(x, y)
+
+        else:
+            
+            lat = v
+            lon = h
+
         pts[0, :] = lon
         pts[1, :] = lat
 
@@ -507,7 +544,7 @@ class DisplacedPoleGrid:
     def generate_I_curve(
         self,
         u: float,
-        split: int = 5, 
+        split: int = 100, 
     ):
         """
         Compute the I curve (mesh zonal circle) given the mesh longitude u.
@@ -518,13 +555,16 @@ class DisplacedPoleGrid:
         # initial point: on the equator
         x0 = np.cos(u)
         y0 = np.sin(u)
-        number_of_grids = self.number_of_rows_in_northern_hemisphere
-        integration_steps = number_of_grids * split 
-        dv = np.pi/2 / integration_steps
-        
+        # The mesh north pole is at v = pi/2, where f = g and the J-curve
+        # degenerates to a point: |grad phi|^2 -> 0 and the ODE is 0/0 there.
+        # Stop one row short so the integration never reaches it.
+        number_of_grids = self.number_of_rows_in_NH // 2 - 1
+        integration_steps = number_of_grids * split
+        dv = np.pi/2 / (integration_steps + split)
+
         _, pts_xy = integrate_euler_forward(_I_curve_ray_tracing_system, 0.0, [x0, y0], dv, integration_steps)
 
-        lon, lat = project_stereo_to_sphere(pts_xy[0, ::split], pts_xy[1, ::split])
+        lon, lat = stereo_to_spherical(pts_xy[0, ::split], pts_xy[1, ::split])
         pts = np.zeros((2, number_of_grids + 1))
         pts[0, :] = lon
         pts[1, :] = lat
@@ -533,22 +573,37 @@ class DisplacedPoleGrid:
 
 if __name__ == "__main__":
 
+    d2r = np.deg2rad
+
     displaced_pole_grid = DisplacedPoleGrid(
-        v_trans_tropics_f = 20.0,         # [deg]
-        v_trans_width_tropics_f = 10.0,   # [deg]
-        amp_tropics_f = 1.04,             # [radius/grid_index]
-        v_trans_polar_f = 70.0,          # [deg]
-        v_trans_width_polar_f = 10.0,
-        amp_polar_f = 1.0, # [radius/grid_index]
-        v_trans_g: float, # [deg]
-        v_trans_g_width: float, # [deg]
-        amp_g: float, # [radius/grid_index]
-        number_of_rows_in_northern_hemisphere: int,
-        number_of_rows_in_southern_hemisphere: int,
-        number_of_columns: int,
+        displaced_north_pole_lat = d2r(40.0),   # mesh north pole latitude
+        v_trans_tropics_f        = d2r(20.0),   # tropical refinement knee, f
+        v_trans_width_tropics_f  = d2r(10.0),
+        v_trans_polar_f          = d2r(70.0),   # polar knee, f
+        v_trans_width_polar_f    = d2r(10.0),
+        v_trans_g                = d2r(40.0),   # polar knee, g
+        v_trans_g_width          = d2r( 6.0),
+        resolution_equator       = d2r( 3.0),   # [rad/grid] meridional, at the equator
+        resolution_polar         = d2r( 3.0),   # [rad/grid] meridional, at resolution_polar_v
+        resolution_polar_v       = d2r(-30.0),  # where resolution_polar applies
+        number_of_rows_in_NH     = 30,
+        latitude_bounds_in_SH    = d2r(np.linspace(-90, 0, 31)),
+        number_of_columns        = 180,
     )
-    J_curves = [spherical_to_cartesian(generate_J_curve_from_s(s, 50)) for s in np.linspace(-np.pi/2, np.pi/2, 10)]
-    I_curves = [spherical_to_cartesian(generate_I_curve(s_i, 20, 25, 1)) for s_i in np.linspace(0.0, 2*np.pi, 10)[::-1]]
+
+    print(f"A1 = {displaced_pole_grid.A1:+.6f}   "
+          f"W_polar_f = {displaced_pole_grid.W_polar_f:+.6f}   "
+          f"W_tropics_f = {displaced_pole_grid.W_tropics_f:+.6f}")
+    print(f"B1 = {displaced_pole_grid.B1:+.6f}   "
+          f"W_g = {displaced_pole_grid.W_g:+.6f}")
+
+    # v = +pi/2 is the mesh north pole, where the J-curve is a single point,
+    # so stop just short of both ends when drawing.
+    v_draw = np.linspace(-np.pi/2, np.pi/2, 30)[1:-1]
+    J_curves = [spherical_to_cartesian(displaced_pole_grid.generate_J_curve(v))
+                for v in v_draw]
+    I_curves = [spherical_to_cartesian(displaced_pole_grid.generate_I_curve(u))
+                for u in np.linspace(0.0, 2*np.pi, 13)[:-1]]
 
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 1, subplot_kw={'projection': '3d'})
@@ -557,11 +612,10 @@ if __name__ == "__main__":
     ax.scatter(0, 0, 0, color="red", s=10)
 
     for i, I_curve in enumerate(I_curves):
-        ax.scatter(I_curve[0, :], I_curve[1, :], I_curve[2, :])
+        ax.scatter(I_curve[0, :], I_curve[1, :], I_curve[2, :], s=4)
 
     for j, J_curve in enumerate(J_curves):
-        ax.scatter(J_curve[0, :], J_curve[1, :], J_curve[2, :], marker="s")
-
+        ax.scatter(J_curve[0, :], J_curve[1, :], J_curve[2, :], marker="s", s=2)
 
     ax.set_xlabel("x-direction")
     ax.set_ylabel("y-direction")
@@ -572,5 +626,3 @@ if __name__ == "__main__":
     ax.set_ylim(lim)
     ax.set_zlim(lim)
     plt.show()
-
-
