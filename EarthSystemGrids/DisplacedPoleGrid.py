@@ -1,157 +1,15 @@
 import numpy as np
-import scipy.integrate as itg
-
-"""
-Displaced Pole Grid
-
-Reference:
-
-  -
-
-"""
-
-def function_f(s_j:float):
-    """
-    s_j in [-pi/2, pi/2] is the mesh latitude.
-    f has to be decreasing when s_j increases.
-    """
-
-    return np.tan(np.pi/4 - s_j/2)  #2.0 * ( -1.0 + s_j )
-
-def function_dfds_j(s_j:float):
-    """
-    the derivative of f over s_j
-    """
-    return (np.cos(np.pi/4 - s_j/2))**(-2.0) * (-1/2)
-
-
-def function_g(s_j:float):
-    """
-    s_j in [0, 1]. 0 is at mesh south pole, 0.5 is at the equator, and 1 is at
-    the mesh north pole. g has to be increasing when s increases.
-    """
-    if s_j <= 0:
-        return - function_f(s_j)
-    else:
-        return - np.tan(np.pi/4 - s_j/2)
-
-def function_dgds_j(s_j:float):
-    """
-    the derivative of g over s_j
-    """
-    if s_j <= 0:
-        return - function_dfds_j(s_j)
-    else:
-        return - function_dfds_j(s_j)
-
-def I_curve_system(s, variables):
-
-    x, y = variables
-
-    f = function_f(s)
-    g = function_g(s)
-    df_ds = function_dfds_j(s)
-    dg_ds = function_dgds_j(s)
-
-    C = f + g
-    P = f * g
-    grad_phi_square = 4 * x**2 + (2 * y - C)**2
-    dC_ds = df_ds + dg_ds
-    dP_ds = df_ds * g + f * dg_ds
-
-    dphi_ds = dP_ds - dC_ds * y
-
-    dx_ds = - 2*x * (dphi_ds / grad_phi_square)
-    dy_ds = - (2*y - C) * (dphi_ds / grad_phi_square)
-
-    return np.array([
-        dx_ds,
-        dy_ds,
-    ])
+import functools
 
 def project_stereo_to_sphere(x:float, y:float):
     """
     Project stereographic coordinate back to sphere coordinate.
     Unit circle means equator, and center means northpole.
     """
-    lon = np.arctan2(y, x)
-    lat = np.pi / 2.0 - 2 * np.arctan((x**2 + y**2)**0.5)
+    lon = np.rad2deg(np.arctan2(y, x))
+    lat = np.rad2deg(np.pi / 2.0 - 2 * np.arctan((x**2 + y**2)**0.5))
 
     return lon, lat
-
-def generate_J_curve_from_s(
-    s_j: float,
-    number_of_points: int,
-):
-    """
-    Compute the J curve (mesh zonal circle) given the mesh latitude s_j.
-    """
-
-    f = function_f(s_j)
-    g = function_g(s_j)
-
-    r   = (g - f) / 2.0
-    y_c = (g + f) / 2.0
-
-    dh = np.deg2rad(360.0 / number_of_points)
-    h = 0.0 + np.arange(number_of_points) * dh
-
-    pts = np.zeros((2, number_of_points))
-
-    x =       r * np.cos(h)
-    y = y_c + r * np.sin(h)
-
-    lon, lat = project_stereo_to_sphere(x, y)
-    pts[0, :] = lon
-    pts[1, :] = lat
-
-    return pts
-
-def generate_I_curve_from_s(
-    s_i: float,
-    number_of_points: int,
-):
-    """
-    Compute the I curve (mesh zonal circle) given the mesh longitude s_i.
-    """
-
-    # initial point: on the equator
-    x0 = np.cos(s_i)
-    y0 = np.sin(s_i)
-    ds = np.pi/2 / number_of_points
-    _, pts_xy = integrate_euler_forward(I_curve_system, 0.0, [x0, y0], ds, number_of_points-1)
-
-    lon, lat = project_stereo_to_sphere(pts_xy[0, :], pts_xy[1, :])
-    pts = np.zeros((2, number_of_points))
-    pts[0, :] = lon
-    pts[1, :] = lat
-
-    return pts
-
-
-def generate_I_curve(
-    s_i: float,
-    J_eq: int,
-    J_M: int,
-    split: int, 
-):
-    """
-    Compute the I curve (mesh zonal circle) given the mesh longitude s_i.
-    """
-    # initial point: on the equator
-    x0 = np.cos(s_i)
-    y0 = np.sin(s_i)
-    number_of_grids = J_M - J_eq
-    integration_steps = number_of_grids * split 
-    ds = (np.pi/2) / integration_steps
-    _, pts_xy = integrate_euler_forward(I_curve_system, 0.0, [x0, y0], ds, integration_steps)
-
-    lon, lat = project_stereo_to_sphere(pts_xy[0, ::split], pts_xy[1, ::split])
-    pts = np.zeros((2, number_of_grids + 1))
-    pts[0, :] = lon
-    pts[1, :] = lat
-
-    return pts
 
 def spherical_to_cartesian(
     r_sphere,
@@ -163,8 +21,8 @@ def spherical_to_cartesian(
     Convert from spherical coordinate to lonlat
     The 0th axis is (x, y, z), the 1st axis is the points
     """
-    lon = r_sphere[lon_idx, :]
-    lat = r_sphere[lat_idx, :]
+    lon = np.deg2rad(r_sphere[lon_idx, :])
+    lat = np.deg2rad(r_sphere[lat_idx, :])
     x = r * np.cos(lat) * np.cos(lon)
     y = r * np.cos(lat) * np.sin(lon)
     z = r * np.sin(lat)
@@ -184,12 +42,424 @@ def integrate_euler_forward(dydt, t0, y0, dt, steps):
 
     return t, y
 
+def integrate_rk4(dydt, t0, y0, t_targets, substeps=25):
+    """
+    March to each entry of `t_targets` in turn, sub-stepping in between.
 
+    The step size is decoupled from the row spacing, so the rows can be placed
+    wherever the design wants them, and the integrator never has to take a step
+    comparable to the shrinking radius near the pole.
+    """
+    y = np.array(y0, dtype=float)
+    t = float(t0)
+    out = np.zeros((len(y0), len(t_targets)))
+    for k, t_end in enumerate(t_targets):
+        dt = (t_end - t)/substeps
+        for _ in range(substeps):
+            k1 = dydt(t,          y)
+            k2 = dydt(t + dt/2.0, y + dt/2.0*k1)
+            k3 = dydt(t + dt/2.0, y + dt/2.0*k2)
+            k4 = dydt(t + dt,     y + dt*k3)
+            y = y + dt/6.0*(k1 + 2*k2 + 2*k3 + k4)
+            t = t + dt
+        t = t_end                        # remove accumulated drift
+        out[:, k] = y
+    return t, out
+
+
+def I_curve_ray_tracing_system(
+    v,
+    variables,
+    FG_funcs,
+):
+
+    x, y = variables
+
+    f = FG_funcs.f(v)
+    g = FG_funcs.g(v)
+    df_dv = FG_funcs.dfdv(v)
+    dg_dv = FG_funcs.dgdv(v)
+
+    C = f + g
+    P = f * g
+    grad_phi_square = 4 * x**2 + (2 * y - C)**2
+    dC_dv = df_dv + dg_dv
+    dP_dv = df_dv * g + f * dg_dv
+
+    dphi_dv = dP_dv - dC_dv * y
+
+    dx_dv = - 2*x * (dphi_dv / grad_phi_square)
+    dy_dv = - (2*y - C) * (dphi_dv / grad_phi_square)
+
+    return np.array([
+        dx_dv,
+        dy_dv,
+    ])
+
+def _logcosh(x):
+    """
+    log(cosh(x)), evaluated so that it cannot overflow.
+
+    cosh(x) itself returns inf beyond |x| of about 710, and the ratio of two
+    such gives inf or nan. That is reachable here: a transition width of 0.1 deg
+    over a 90 deg span already puts the argument at 1100. This identity is exact
+    and safe everywhere.
+    """
+    abs_x = np.abs(x)
+    return abs_x + np.log1p(np.exp(-2.0*abs_x)) - np.log(2.0)
+
+
+def beta(
+    v: float,
+    v_transition: float,
+    dv_transition_width: float,
+):
+    """
+    Base shape function for building f and g: a smooth, odd, monotonically
+    increasing RAMP.
+
+    It is the antiderivative of `dbeta_dv` that vanishes at the origin, so the
+    two satisfy exactly
+
+        d(beta)/dv  =  dbeta_dv
+
+    Shape. beta rises with unit slope through the origin, then bends over once
+    |v| passes v_transition and levels off at
+
+        beta(+/- inf)  =  +/- v_transition / tanh(v_transition/dv_transition_width)
+
+    which is +/- v_transition to within a fraction of a percent whenever the
+    width is small compared with v_transition. So beta is in effect "v itself,
+    smoothly clipped to +/- v_transition".
+
+    Exact properties:
+
+        beta(0)          =  0
+        beta(-v)         = -beta(v)                 (odd)
+        d(beta)/dv at 0  =  1                       (unit slope at the origin)
+
+    Parameters
+    ----------
+    v                   : pseudo-latitude, in degree.
+    v_transition        : where the ramp levels off, in degree. The two knees
+                          sit at v = +v_transition and v = -v_transition.
+    dv_transition_width : how abruptly it levels off, in degree. Small values
+                          give a sharp corner, large values a gentle bend.
+
+    Returns
+    -------
+    In the same units as v (degree), because integrating the dimensionless
+    `dbeta_dv` over v carries v's units. Worth watching when combining beta with
+    coefficients that feed f and g, which are dimensionless stereographic radii.
+    """
+    c = 2.0 * np.tanh(v_transition/dv_transition_width)
+    return (
+          _logcosh( (v + v_transition) / dv_transition_width )
+        - _logcosh( (v - v_transition) / dv_transition_width )
+    ) * dv_transition_width / c
+
+
+def dbeta_dv(
+    v: float,
+    v_transition: float,
+    dv_transition_width: float,
+):
+    """
+    Derivative of `beta`: a smooth, even PLATEAU -- a top hat with rounded
+    shoulders -- built from the difference of two hyperbolic tangents.
+
+    Shape. Flat at 1 near v = 0, falling away through the two shoulders at
+    v = +/- v_transition, and decaying to 0 beyond them.
+
+    Exact properties:
+
+        dbeta_dv(0)   =  1, and this is the maximum
+        dbeta_dv(-v)  =  dbeta_dv(v)                (even)
+
+        dbeta_dv(+/- v_transition)
+                      =  tanh(2*v_transition/w) / (2*tanh(v_transition/w))
+
+    where w = dv_transition_width. That last value is the HALF maximum, 0.5, to
+    within a fraction of a percent whenever w is small compared with
+    v_transition -- 0.50034 for v_transition = 20 deg, w = 5 deg. So
+    v_transition marks the half-height points of the plateau, not its foot.
+
+    The 1/c normalisation is what pins the peak at exactly 1; without it the
+    amplitude would drift as the width is changed.
+
+    Parameters
+    ----------
+    v                   : pseudo-latitude, in degree.
+    v_transition        : half-width of the plateau, in degree.
+    dv_transition_width : shoulder width, in degree.
+
+    Returns
+    -------
+    Dimensionless, and independent of the units of v, being a ratio of tanh
+    differences. Only `beta` carries units.
+    """
+    c = 2.0 * np.tanh(v_transition/dv_transition_width)
+    return (
+            np.tanh( (v + v_transition) / dv_transition_width )
+          - np.tanh( (v - v_transition) / dv_transition_width )
+    ) / c
+
+
+class DisplacedPoleGrid:
+    """
+    Displaced Pole Grid
+
+    Reference:
+
+      - Madec, G. and M. Imbard (1996), A global ocean mesh to overcome the North
+        Pole singularity. Climate Dynamics 12(6), 381-388.
+
+    Mesh parallels (J curves) are circles in the north polar stereographic plane
+
+        x^2 + y^2 - ( f + g ) y + f g = 0
+
+        f = the northern crossing of the y-axis
+        g = the southern crossing of the y-axis
+        centre = ( 0, (f+g)/2 )        radius = (g-f)/2
+
+    Pseudo-latitude:    v [deg]
+    Pseudo-longitude:   u [deg]
+
+    ---
+
+    # The functions f and g, and how to solve them
+
+    The function f is found by first defining its derivative, df/dv, with respect to pseudo
+    latitude because the resolution of grid along the y-axis, degrees per grid, corresponds
+    to scale factor along the y-axis. 
+
+    In Madec and Imbard (1996) they use hyperbolic tangent to construct the resolution dg/dj.
+    It is useful, but I alternate the way to prettify the math. First of all, dg/dj depends on
+    the grid resolution, and g' = g'(j) is difficult when designing the function. Therefore,
+    I enforce every expression to be in pseudo-latitude v. The only exception is that users
+    provide resolution dlat/dj because that is intuitive. The dlat/dj will translate into dg/dv
+    through the chain rule, as will be explained in later sections.
+
+    The df/dv and dg/dv are designed as a sum of pleateau-shaped functions beta. 
+
+        df/dv(v)   = A1 - W^f_trop * dbeta^f_trop/dv + W^f_polar * dbeta^f_polar/dv
+        dg/dv(v<0) = -df/dv
+        dg/dv(v>0) = -B1 - W^g_polar * dbeta^g_polar/dv
+
+    where A1 and B1 are the base resolution, W is the amplitude of the resolution transition,
+    with supscript being the function it belongs to and subscript being the location the transition
+    happens. Because f' > 0 and g' < 0 are two necessary conditions, the signs are chosen so that
+    we should expect W terms to be positive to be physically interpretable. The function dbeta/dv
+    is made of two hyperbolic tangents,
+
+        dbeta/dv(v) = c ( tanh((v+v_tran)/Delta_v) + tanh((v-v_tran)/Delta_v) )
+
+    where v_tran is the transition latitude, Delta_v the transition width, and c the normalization
+    constant such that dbeta/dv(v=0) = 1.
+
+    The f and g follows
+
+        f(v)   = A0 + A1 v - W^f_trop * beta^f_trop + W^f_polar * beta^f_polar
+        g(v<0) = -f
+        g(v>0) = B0 - B1 v - W^g_polar * beta^g_polar
+
+    Because Claude points out that the paper's boundary conditions do not seem to satisfy the 
+    condition that f(v=90deg) = g(v=90deg), I decide to do it in my way. So, the system I am 
+    solving is
+
+        Unknowns: A0, A1, B0, B1, W^f_trop, W^f_polar, and W^g_polar.
+        Boundary conditions:
+            
+            (1) f(0) = -1
+            (2) g(0) =  1
+            (3) df/dv(0) =   s_0
+            (4) dg/dv(0) = - s_0
+            (5) f(90deg) = y_np
+            (6) g(90deg) = y_np
+            (7) f'(v_max) = s_f
+
+    where s_0 and s_g is the resolution at the equator and the maximum latitude of the grid,
+    and y_np being the y location of the displaced north pole.
+
+    # How to see df/dv and dg/dv encompass grid resolution
+
+    The scale factor along the meridional direction is
+
+        e_2 = a sqrt( (dlon/dj * cos(lat))^2 + (dlat/dj)^2 )
+
+    where j is the grid index. Evaluate the trajectory tracking the y-axis intercept
+    (x, y) = (0, g(u)) gives
+
+        e_2 = a dlat/dj
+            = a d/dj (pi/2 - 2 arctan(|g|) )
+            = -2 a sgn(g) / (1 + g^2) * (dg/dv) (dv/dj) 
+    
+    Rearranging the above gives
+
+        dg/dv = -1/2 (dlat/dj) sgn(g) (1+g^2) / (dv/dj)
+
+    and similarly for f
+        
+        df/dv = -1/2 (dlat/dj) sgn(f) (1+f^2) / (dv/dj)
+
+    This is a pratical expression because user can specify the grid resolution dlat/dj
+    and obtain df/dv for a particular location. 
+    
+    """
+   
+    def __init__(
+        self,
+        displaced_north_pole_lat: float, # [deg]
+        displaced_north_pole_lon: float, # [deg]
+        dfdv_v_transition_tropics: float, # [deg]
+        dfdv_v_transition_width_tropics: float, # [deg]
+        dfdv_v_transition_polar: float, # [deg]
+        dfdv_v_transition_width_polar: float,
+        dgdv_v_transition: float, # [deg]
+        dgdv_v_transition_width: float, # [deg]
+        number_of_rows_in_northern_hemisphere: int,
+        number_of_rows_in_southern_hemisphere: int,
+        number_of_columns: int,
+    ):
+        self.displaced_north_pole_lat = displaced_north_pole_lat 
+        self.displaced_north_pole_lon = displaced_north_pole_lon 
+        self.dfdv_v_transition_tropics = dfdv_v_transition_tropics
+        self.dfdv_v_transition_width_tropics = dfdv_v_transition_width_tropics
+        self.dfdv_v_transition_polar = dfdv_v_transition_polar
+        self.dfdv_v_transition_width_polar = dfdv_v_transition_width_polar
+        self.dgdv_v_transition = dgdv_v_transition
+        self.dgdv_v_transition_width = dgdv_v_transition_width
+        self.dfdv_amp_tropics = dfdj_amp_tropics
+        self.dfdv_amp_polar = dfdj_amp_polar
+        self.dgdv_amp = dgdj_amp
+        self.number_of_rows_in_northern_hemisphere = number_of_rows_in_northern_hemisphere
+        self.number_of_rows_in_southern_hemisphere = number_of_rows_in_southern_hemisphere
+        self.number_of_columns = number_of_columns
+       
+        self.v_bounds = np.concatenate((
+            np.linspace(-90.0, 0.0, number_of_rows_in_southern_hemisphere+1),
+            np.linspace(0, 90.0, number_of_rows_in_southern_hemisphere+1)[1:],
+        ))
+        self.j_eq = number_of_rows_in_southern_hemisphere 
+        def dvdj(j):
+            if j < self.number_of_rows_in_southern_hemisphere:
+                return 90.0 / number_of_rows_in_southern_hemisphere
+            else:
+                return 90.0 / number_of_rows_in_northern_hemisphere
+        
+        self.dvdj = dvdj
+        
+        self.A0 = 1.0 
+        self.A1 = 1.0
+        self.B0 = 1.0
+        self.B1 = 1.0
+
+
+    def dfdv(self, v):
+        return self.A1 + (
+            - self.dfdv_amp_tropics * dbeta_dv(v, self.dfdv_v_transition_tropics, self.dfdv_v_transition_width_tropics)
+            + self.dfdv_amp_polar * dbeta_dv(v, self.dfdv_v_transition_polar, self.dfdv_v_transition_width_polar)
+        )
+
+    def dfdj(self, j):
+        v = self.v_bounds[j]
+        return self.dfdv(v) * self.dvdj(j)
+
+    def f(self, v):
+        return self.A0 + self.A1 * v + (
+            - self.dfdv_amp_tropics * beta(v, self.dfdv_v_transition_tropics, self.dfdv_v_transition_width_tropics)
+            + self.dfdv_amp_polar * beta(v, self.dfdv_v_transition_polar, self.dfdv_v_transition_width_polar)
+        )
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        else:
+            return self.B1 + (
+                self.dgdv_amp * dbeta_dv(v, self.dgdv_v_transition, self.dgdv_v_transition_width)
+            )
+ 
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        else:
+            return self.B0 + self.B1 * v + (
+                self.dgdv_amp * beta(v, self.dgdv_v_transition, self.dgdv_v_transition_width)
+            )
+    
+    def generate_J_curve(
+        self,
+        v: float,
+    ):
+        """
+        Compute the J curve (mesh zonal circle) given the mesh latitude s_j.
+        """
+
+        pts = np.zeros((2, self.number_of_columns))
+        dh = np.deg2rad(360.0 / self.number_of_columns)
+        
+        h = 0.0 + np.arange(self.number_of_columns) * dh
+
+        f = self.f(v)
+        g = self.g(v)
+
+        r   = (g - f) / 2.0
+        y_c = (g + f) / 2.0
+
+        x =       r * np.cos(h)
+        y = y_c + r * np.sin(h)
+
+        lon, lat = project_stereo_to_sphere(x, y)
+        pts[0, :] = lon
+        pts[1, :] = lat
+
+        return pts
+
+    def generate_I_curve(
+        self,
+        u: float,
+        split: int = 5, 
+    ):
+        """
+        Compute the I curve (mesh zonal circle) given the mesh longitude u.
+        """
+
+        _I_curve_ray_tracing_system = functools.partial(I_curve_ray_tracing_system, FG_funcs=self)
+
+        # initial point: on the equator
+        x0 = np.cos(np.deg2rad(u))
+        y0 = np.sin(np.deg2rad(u))
+        number_of_grids = self.number_of_rows_in_northern_hemisphere
+        integration_steps = number_of_grids * split 
+        dv = 90.0 / integration_steps
+        
+        _, pts_xy = integrate_euler_forward(_I_curve_ray_tracing_system, 0.0, [x0, y0], dv, integration_steps)
+
+        lon, lat = project_stereo_to_sphere(pts_xy[0, ::split], pts_xy[1, ::split])
+        pts = np.zeros((2, number_of_grids + 1))
+        pts[0, :] = lon
+        pts[1, :] = lat
+
+        return pts
 
 if __name__ == "__main__":
 
+    displaced_pole_grid = DisplacedPoleGrid(
+        dfdv_v_transition_tropics = 20.0, # [deg]
+        dfdv_v_transition_width_tropics = 10.0, # [deg]
+        dfdj_amp_tropics = 1.04, # [radius/grid_index]
+        dfdv_v_transition_polar = 70.0, # [deg]
+        dfdv_v_transition_width_polar = 10.0,
+        dfdj_amp_polar = 1.0, # [radius/grid_index]
+        dgdv_v_transition: float, # [deg]
+        dgdv_v_transition_width: float, # [deg]
+        dgdj_amp: float, # [radius/grid_index]
+        number_of_rows_in_northern_hemisphere: int,
+        number_of_rows_in_southern_hemisphere: int,
+        number_of_columns: int,
+    )
     J_curves = [spherical_to_cartesian(generate_J_curve_from_s(s, 50)) for s in np.linspace(-np.pi/2, np.pi/2, 10)]
-    I_curves = [spherical_to_cartesian(generate_I_curve(s_i, 20, 60, 1)) for s_i in np.linspace(0.0, 2*np.pi, 10)[::-1]]
+    I_curves = [spherical_to_cartesian(generate_I_curve(s_i, 20, 25, 1)) for s_i in np.linspace(0.0, 2*np.pi, 10)[::-1]]
 
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 1, subplot_kw={'projection': '3d'})
