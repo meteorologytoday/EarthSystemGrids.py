@@ -843,6 +843,153 @@ class FGCubic(FGBase):
         return rows
 
 
+class FGPolynomialStep(FGBase):
+    """
+    Smoothstep formulation: the RATE is a cubic step between two levels.
+
+        gamma(t) = 1 - 3 t^2 + 2 t^3          gamma(0)=1, gamma(1)=0
+        f'(v)    = B + A gamma(v / w)
+        f (v)    = c + B v + A w Gamma(v / w),   Gamma(t) = t - t^3 + t^4/2
+
+    Three unknowns per branch and three conditions, so the solve is a 2x2 after
+    the constant falls out. `w` is a hand-chosen shape parameter, not solved.
+
+    Why w >= V_MAX matters
+    ----------------------
+    gamma is monotone decreasing only on [0, 1]; past t = 1 its derivative
+    6t(t-1) turns positive and it grows again. Requiring w >= V_MAX keeps the
+    argument inside [0, 1], and then f' is monotone in v and therefore trapped
+    between its own endpoint values. Monotonicity of f collapses to a single
+    scalar test that can be made before evaluating anything:
+
+        f'(0) = s0 > 0 by construction, so  f increasing  <=>  f'(v_max) > 0
+
+    The determinant of the 2x2 is w Gamma(T) - v_max = -v_max T^2 (1 - T/2)
+    with T = v_max/w, strictly negative for T in (0, 1]. It vanishes only as
+    w -> infinity, where gamma is flat and f' cannot bend enough to reach y_NP.
+
+    Boundary conditions
+    -------------------
+        f(0) = -1,  f'(0) = +s0,  f(v_max) = y_NP
+        g(0) = +1,  g'(0) = -s0,  g(v_max) = y_NP
+
+    The polar rates f'(v_max) and g'(v_max) are OUTCOMES, not inputs. That is
+    the price of the simple solve and the cheap guarantee.
+
+    The g branch is the binding one
+    ------------------------------
+    f travels y_NP + 1 while g travels only y_NP - 1 -- 2.75x less at a 40 N
+    mesh pole -- yet C1 across the equator forces both to start at |slope| = s0.
+    So g must shed much more slope over the same v range, and it is g, not f,
+    that turns around first. At w = V_MAX the condition is exactly
+
+        s0 < 2 (1 - y_NP) / v_max
+
+    which is 0.68 for a pole at 40 N and only 0.38 at 20 N. In grid terms s0 is
+    the equatorial spacing divided by dv/dj, so this says the equator must be
+    meaningfully finer than uniform -- ordinary tropical refinement, but it is a
+    real constraint and `_scheme_checks` guards both branches.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 v_width_f,                     # [rad] must be >= V_MAX
+                 v_width_g=None):               # [rad] defaults to v_width_f
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
+        self.v_width_f = v_width_f
+        self.v_width_g = v_width_f if v_width_g is None else v_width_g
+        for name, w in (("v_width_f", self.v_width_f), ("v_width_g", self.v_width_g)):
+            if w < self.v_max:
+                raise ValueError(
+                    f"{name} = {np.rad2deg(w):.2f} deg is below V_MAX = "
+                    f"{np.rad2deg(self.v_max):.2f} deg. gamma is only monotone on "
+                    f"[0, 1], so a narrower width lets the rate turn around inside "
+                    f"the domain and the monotonicity guarantee is lost.")
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    @staticmethod
+    def _gamma(t):
+        return 1.0 - 3.0*t**2 + 2.0*t**3
+
+    @staticmethod
+    def _Gamma(t):
+        """Antiderivative of _gamma vanishing at 0."""
+        return t - t**3 + 0.5*t**4
+
+    def _branch(self, slope_at_0, total_rise, w):
+        """(B, A) from  B + A = slope_at_0  and  B v_max + A w Gamma(T) = total_rise."""
+        T = self.v_max / w
+        return np.linalg.solve(
+            np.array([[1.0,        1.0],
+                      [self.v_max, w*self._Gamma(T)]]),
+            np.array([slope_at_0, total_rise]))
+
+    def _solve(self):
+        self.c_f = -1.0
+        self.c_g = +1.0
+        self.B_f, self.A_f = self._branch(+self.s0, self.y_NP - self.c_f, self.v_width_f)
+        self.B_g, self.A_g = self._branch(-self.s0, self.y_NP - self.c_g, self.v_width_g)
+
+    def f(self, v):
+        w = self.v_width_f
+        return self.c_f + self.B_f*v + self.A_f*w*self._Gamma(v/w)
+
+    def dfdv(self, v):
+        return self.B_f + self.A_f*self._gamma(v/self.v_width_f)
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        w = self.v_width_g
+        return self.c_g + self.B_g*v + self.A_g*w*self._Gamma(v/w)
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        return self.B_g + self.A_g*self._gamma(v/self.v_width_g)
+
+    def max_dlat_dv_equator(self):
+        """
+        Largest s0 for which BOTH branches stay monotone, found from the closed
+        form of the endpoint rates. Useful for reporting why a configuration was
+        rejected, since g binds well before f does.
+        """
+        out = []
+        for sign, c, w in ((+1.0, self.c_f, self.v_width_f),
+                           (-1.0, self.c_g, self.v_width_g)):
+            T = self.v_max / w
+            # endpoint rate is affine in s0; solve  rate(s0) = 0  from two samples
+            r = []
+            for s in (1.0, 2.0):
+                B, A = self._branch(sign*s, self.y_NP - c, w)
+                r.append(sign*(B + A*self._gamma(T)))
+            out.append(1.0 + (2.0 - 1.0)*(0.0 - r[0])/(r[1] - r[0]))
+        return min(out)
+
+    def transition_marks(self):
+        marks = [(self.v_width_f, "v_width_f")]
+        if self.v_width_g != self.v_width_f:
+            marks.append((self.v_width_g, "v_width_g"))
+        return marks
+
+    def _scheme_checks(self):
+        """
+        Both endpoint rates, which is the whole of the monotonicity question for
+        this scheme: gamma keeps f' and g' trapped between their endpoints, so
+        signs at the two ends are necessary and sufficient.
+        """
+        Tf = self.v_max / self.v_width_f
+        Tg = self.v_max / self.v_width_g
+        return [
+            ("f'(v_max) > 0 (outcome)", self.B_f + self.A_f*self._gamma(Tf), 0.0, "gt"),
+            ("g'(v_max) < 0 (outcome)", self.B_g + self.A_g*self._gamma(Tg), 0.0, "lt"),
+        ]
+
+
 class DisplacedPoleGrid:
     """
     Displaced Pole Grid
@@ -1313,6 +1460,16 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
             v_trans_width_polar_f    = d2r(10.0),
             v_trans_g                = d2r(30.0),   # polar knee, g
             v_trans_g_width          = d2r(10.0),
+        )
+    elif formulation == "polystep":
+        # gamma keeps the rate trapped between its endpoints only while the
+        # g branch stays monotone, which needs s0 below roughly
+        # 2(1 - y_NP)/v_max -- i.e. the equator must be finer than uniform.
+        # dlat_in_SH_degree = 1.5 with 30 northern rows gives s0 = 0.5.
+        fg = FGPolynomialStep(
+            displaced_north_pole_lat = d2r(40.0),
+            dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
+            v_width_f                = V_MAX,
         )
     elif formulation == "cubic":
         fg = FGCubic(
