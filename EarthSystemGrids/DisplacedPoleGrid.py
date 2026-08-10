@@ -3,6 +3,14 @@ import functools
 
 import numpy as np
 
+# The northern branch runs from the equator to the mesh north pole, and the
+# pseudo-latitude v mirrors geographic latitude, so the pole sits at v = pi/2.
+# This is structural, not a convention that can be varied: the grid discretises
+# [0, V_MAX] into number_of_rows_in_NH rows, and a formulation that met its
+# boundary conditions at some other v_max would meet them at a location the grid
+# never visits.
+V_MAX = np.pi / 2
+
 def spherical_to_stereo(lon:float, lat:float):
     """
     Project sphere coordinate to stereographic.
@@ -334,13 +342,17 @@ class FGBase(abc.ABC):
     sees dv/dj or the row count. The shape is a fixed curve and dv/dj carries the
     resolution; changing the number of rows must not change this object.
 
+    v runs over [0, V_MAX] with V_MAX = pi/2, the mesh north pole. That end
+    point is fixed by the construction, so it is not a constructor argument;
+    `self.v_max` exists only so the conditions read naturally.
+
     Subclasses must implement f, dfdv, g, dgdv, and may override
     `_scheme_checks` and `transition_marks`.
     """
 
-    def __init__(self, displaced_north_pole_lat, dlat_dv_equator, v_max=np.pi/2):
+    def __init__(self, displaced_north_pole_lat, dlat_dv_equator):
         self.displaced_north_pole_lat = displaced_north_pole_lat
-        self.v_max = v_max
+        self.v_max = V_MAX
         _, self.y_NP = spherical_to_stereo(np.pi/2, displaced_north_pole_lat)
         # At the equator f = -1, so the Jacobian 2/(1+f^2) is exactly 1 and this
         # reduces to s0 = dlat_dv_equator. Written through the general
@@ -613,9 +625,8 @@ class FGLogCosh(FGBase):
                  v_trans_polar_f,               # [rad]
                  v_trans_width_polar_f,         # [rad]
                  v_trans_g,                     # [rad]
-                 v_trans_g_width,               # [rad]
-                 v_max=np.pi/2):
-        super().__init__(displaced_north_pole_lat, dlat_dv_equator, v_max)
+                 v_trans_g_width):              # [rad]
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
         self.dlat_dv_polar = dlat_dv_polar
         self.v_polar = v_polar
         self.v_trans_tropics_f = v_trans_tropics_f
@@ -746,9 +757,8 @@ class FGCubic(FGBase):
                  displaced_north_pole_lat,      # [rad]
                  dlat_dv_equator,               # [rad lat / rad v]
                  dlat_dv_polar_f,               # [rad lat / rad v] at v_max, f branch
-                 dlat_dv_polar_g,               # [rad lat / rad v] at v_max, g branch
-                 v_max=np.pi/2):
-        super().__init__(displaced_north_pole_lat, dlat_dv_equator, v_max)
+                 dlat_dv_polar_g):              # [rad lat / rad v] at v_max, g branch
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
         self.dlat_dv_polar_f = dlat_dv_polar_f
         self.dlat_dv_polar_g = dlat_dv_polar_g
         self._solve()
@@ -880,7 +890,7 @@ class DisplacedPoleGrid:
         # v parameterises only the northern branch, equator to mesh pole. dv/dj
         # carries the resolution and `fg` never sees it, which is what keeps the
         # formulation independent of how finely the grid is discretised.
-        self.dvdj = (np.pi/2) / number_of_rows_in_NH
+        self.dvdj = V_MAX / number_of_rows_in_NH
 
     def generate_J_curve(
         self,
@@ -992,7 +1002,7 @@ class DisplacedPoleGrid:
         latitude_bounds_in_SH = np.asarray(latitude_bounds_in_SH, dtype=float)
 
         if v_interfaces_in_NH is None:
-            v_interfaces_in_NH = np.linspace(0.0, np.pi/2, self.number_of_rows_in_NH + 1)[:-1]
+            v_interfaces_in_NH = np.linspace(0.0, V_MAX, self.number_of_rows_in_NH + 1)[:-1]
         v_interfaces_in_NH = np.asarray(v_interfaces_in_NH, dtype=float)
 
         ni = self.number_of_columns
@@ -1289,7 +1299,7 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
     kind of object and DisplacedPoleGrid cannot tell them apart.
     """
     d2r = np.deg2rad
-    dvdj = (np.pi/2) / number_of_rows_in_NH
+    dvdj = V_MAX / number_of_rows_in_NH
 
     if formulation == "logcosh":
         fg = FGLogCosh(
@@ -1439,7 +1449,7 @@ def test_plot_fg_derivatives(output_file: str = None):
     fg = grid.fg
     r2d = np.rad2deg
 
-    v = np.linspace(-np.pi/2, np.pi/2, 1201)
+    v = np.linspace(-V_MAX, V_MAX, 1201)
     dfdv = np.array([fg.dfdv(vv) for vv in v])
     dgdv = np.array([fg.dgdv(vv) for vv in v])
     f_v  = np.array([fg.f(vv) for vv in v])
