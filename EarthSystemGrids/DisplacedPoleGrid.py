@@ -1335,16 +1335,38 @@ class DisplacedPoleGrid:
         number_of_rows_in_NH: int,
         latitude_bounds_in_SH,           # An array of latitudes [rad], ascending, ending at 0
         number_of_columns: int,
+        pole_longitude: float = np.pi/2,  # [rad] where to put the mesh pole
     ):
         self.fg = fg
         self.number_of_rows_in_NH = number_of_rows_in_NH
         self.latitude_bounds_in_SH = np.asarray(latitude_bounds_in_SH, dtype=float)
         self.number_of_columns = number_of_columns
 
+        # The construction always builds the mesh pole on the +y axis of the
+        # stereographic plane, i.e. at longitude 90 E, because g is by definition
+        # the crossing on that side. Rotating the whole mesh about the Earth's
+        # rotation axis moves it anywhere on that parallel, and costs nothing:
+        # a rotation about the axis is a rotation of the stereographic plane
+        # about its origin, which maps circles to circles and preserves angles,
+        # so every property of the construction survives untouched. It is purely
+        # a relabelling of longitude applied on the way out.
+        self.pole_longitude = pole_longitude
+        self._lon_offset = pole_longitude - np.pi/2
+
         # v parameterises only the northern branch, equator to mesh pole. dv/dj
         # carries the resolution and `fg` never sees it, which is what keeps the
         # formulation independent of how finely the grid is discretised.
         self.dvdj = V_MAX / number_of_rows_in_NH
+
+    def _stereo_to_spherical(self, x, y):
+        """
+        stereo_to_spherical, then rotate longitude so the mesh pole sits at
+        `pole_longitude` rather than at the construction's native 90 E.
+        """
+        lon, lat = stereo_to_spherical(x, y)
+        if self._lon_offset != 0.0:
+            lon = (lon + self._lon_offset + np.pi) % (2.0*np.pi) - np.pi
+        return lon, lat
 
     def generate_J_curve(
         self,
@@ -1369,7 +1391,7 @@ class DisplacedPoleGrid:
             x =       r * np.cos(h)
             y = y_c + r * np.sin(h)
 
-            lon, lat = stereo_to_spherical(x, y)
+            lon, lat = self._stereo_to_spherical(x, y)
 
         else:
             
@@ -1402,7 +1424,7 @@ class DisplacedPoleGrid:
         _, pts_xy = integrate_euler_forward(_I_curve_ray_tracing_system, 0.0, [x0, y0],
                                             self.dvdj, number_of_grids, substeps=split)
 
-        lon, lat = stereo_to_spherical(pts_xy[0, :], pts_xy[1, :])
+        lon, lat = self._stereo_to_spherical(pts_xy[0, :], pts_xy[1, :])
         pts = np.zeros((2, number_of_grids + 1))
         pts[0, :] = lon
         pts[1, :] = lat
@@ -1508,7 +1530,7 @@ class DisplacedPoleGrid:
                 x[split_at:, b] = out[0, 1:]
                 y[split_at:, b] = out[1, 1:]
 
-        lon, lat = stereo_to_spherical(x, y)
+        lon, lat = self._stereo_to_spherical(x, y)
 
         rows_edge   = np.arange(nj) * 2
         rows_edge_1 = rows_edge + 2
@@ -1770,7 +1792,8 @@ def write_to_2D_grid_file(mesh: DisplacedPoleMesh, output_file):
     ds.to_netcdf(output_file)
 
 
-def build_example_grid(number_of_rows_in_NH: int = 30,
+def build_example_grid(pole_longitude_degree: float = 90.0,
+                       number_of_rows_in_NH: int = 30,
                        number_of_columns: int = 120,
                        dlat_in_SH_degree: float = 3.0,
                        southern_edge_degree: float = -90.0,
@@ -1826,31 +1849,27 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
             v_width_f                = V_MAX,
         )
     elif formulation == "tanh":
-        # Tuned so that dg/dv is as nearly constant as the geometry allows.
+        # FGTanh takes all four rates as inputs, so feasibility is a condition on
+        # the whole set, not on s0 alone. Each rate is trapped between its
+        # endpoints, so the mean the geometry demands must lie between them:
         #
-        # dg/dv is monotone and trapped between its endpoints, so its total
-        # variation is exactly |s_g + s0| = s0 - |s_g|. Feasibility squeezes both
-        # ends onto the same number: the mean the geometry demands must lie
-        # inside the interval the endpoints span, giving
+        #     min(s0, s_f)  <= (y_NP + 1)/v_max <= max(s0, s_f)
+        #     s0 >= |mean_g|   and   |s_g| <= |mean_g|
         #
-        #     s0 >= |mean_g|   and   |s_g| <= |mean_g|,
-        #     |mean_g| = (1 - g_target)/v_max = 0.339759 for a 40 N pole
-        #
-        # so the variation is squeezed from both sides towards zero. Sitting
-        # exactly on it would make W_g vanish, leaving v_c undetermined and the
-        # root-find degenerate, so approach instead: these are 1.002 and 0.999
-        # times |mean_g|, giving a 0.3 % spread in dg/dv.
-        #
-        # The cost falls entirely on f, and unavoidably. C1 ties the two
-        # starting rates together while the branches' means differ by 2.75x, so
-        # flattening one steepens the other -- df/dv spreads by 94 % here.
+        # The variation of dg/dv is exactly s0 - |s_g|, so it is minimised by
+        # pushing both onto |mean_g| = (1 - g_target)/v_max -- for a 75 N pole
+        # that is 0.5528, an equatorial spacing of 1.66 deg/row. The settings
+        # below do NOT sit there: they keep the 3 deg equator, which leaves
+        # dg/dv spread over about 130 %. Lower dlat_dv_equator towards |mean_g|
+        # to flatten it, at the cost of steepening df/dv, since C1 ties the two
+        # starting rates together.
         fg = FGTanh(
-            displaced_north_pole_lat = d2r(40.0),
-            dlat_dv_equator          = 0.340439,   # 1.0213 deg/row, just above |mean_g|
-            dlat_dv_polar_f          = 2.000000,   # 6.0 deg/row
-            dlat_dv_polar_g          = 0.557594,   # 1.6728 deg/row, just below |mean_g|
-            v_width_f                = d2r(50.0),
-            v_width_g                = d2r(20.0),
+            displaced_north_pole_lat = d2r(75.0),
+            dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
+            dlat_dv_polar_f          = 1.000000,
+            dlat_dv_polar_g          = 0.557594,
+            v_width_f                = d2r(30.0),
+            v_width_g                = d2r(30.0),
         )
     elif formulation == "cubic":
         fg = FGCubic(
@@ -1864,6 +1883,7 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
 
     return DisplacedPoleGrid(
         fg                       = fg,
+        pole_longitude           = d2r(pole_longitude_degree),
         number_of_rows_in_NH     = number_of_rows_in_NH,
         # stop short of -90: there all meridians converge and e1 -> 0, the
         # ordinary lat-lon pole singularity. Antarctica covers the remainder.
@@ -2175,14 +2195,16 @@ def test_plot_stereographic(output_file: str = None,
     ax.add_patch(Circle((0, 0), 1.0, fill=False, color="k", lw=1.2,
                         ls="--", zorder=4))
     ax.plot(0, 0, "k+", ms=12, mew=1.6, zorder=5)
-    # The mesh pole always sits on the +y axis, i.e. longitude 90 E: g is by
-    # definition the crossing on that side, and the pole is where f meets it.
-    xp, yp = spherical_to_stereo(np.pi/2, grid.fg.displaced_north_pole_lat)
+    # The construction puts the pole on the +y axis (90 E); pole_longitude
+    # rotates the whole mesh about the Earth's axis, so the marker follows.
+    xp, yp = spherical_to_stereo(grid.pole_longitude,
+                                 grid.fg.displaced_north_pole_lat)
     ax.plot(xp, yp, "r*", ms=15, zorder=6)
     ax.annotate("geographic N pole", (0, 0), textcoords="offset points",
                 xytext=(6, 6), fontsize=8)
     ax.annotate(f"mesh pole "
-                f"({np.rad2deg(grid.fg.displaced_north_pole_lat):.0f}N, 90E)",
+                f"({np.rad2deg(grid.fg.displaced_north_pole_lat):.0f}N, "
+                f"{np.rad2deg(grid.pole_longitude):.0f}E)",
                 (xp, yp), textcoords="offset points", xytext=(10, -14),
                 fontsize=8, color="red")
     ax.annotate("equator", (0, -1.0), textcoords="offset points",
