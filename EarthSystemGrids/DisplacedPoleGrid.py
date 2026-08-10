@@ -533,7 +533,7 @@ class FGBase(abc.ABC):
         return ok
 
 
-class FGLogCosh(FGBase):
+class FGMI1996(FGBase):
     """
     The formulation of Madec and Imbard (1996): a linear term plus smooth
     log-cosh ramps, with the coefficients found from a linear system.
@@ -889,7 +889,7 @@ class FGPolynomialStep(FGBase):
             ("g'(v_max) < 0 (outcome)", self.B_g + self.A_g*self._gamma(Tg), 0.0, "lt"),
         ]
 
-class FGTanh(FGBase):
+class FGLogCosh(FGBase):
     """
     An adaptation of Madec and Imbard (1996): define the RATE as a constant plus
     a single hyperbolic tangent, so it is a smooth step between two levels.
@@ -1008,7 +1008,7 @@ class FGTanh(FGBase):
                          (np.sign(vals[:-1])*np.sign(vals[1:]) < 0))[0]
         if len(cross) == 0:
             raise ValueError(
-                "FGTanh: no v_c in [-4 delta, v_max + 4 delta] satisfies the two "
+                "FGLogCosh: no v_c in [-4 delta, v_max + 4 delta] satisfies the two "
                 "value conditions for this combination of rates and width. A "
                 "narrower delta, or endpoint rates closer to the mean the "
                 "geometry demands, will usually admit a solution.")
@@ -1570,7 +1570,7 @@ def build_example_grid(pole_longitude_degree: float = None,
                        number_of_columns: int = 120,
                        dlat_in_SH_degree: float = 3.0,
                        southern_edge_degree: float = -90.0,
-                       formulation: str = "logcosh"):
+                       formulation: str = "mi1996"):
     """
     A worked example with a plain lat-lon southern patch and tropical refinement.
 
@@ -1579,8 +1579,8 @@ def build_example_grid(pole_longitude_degree: float = None,
     two only make sense together -- a latitude that sits on land at one longitude
     sits in open ocean at another. Pass pole_longitude_degree to override.
 
-        logcosh / cubic / polystep / linear   40 N,  90 E   (western China)
-        tanh                                  72 N,  40 W   (Greenland)
+        mi1996 / polystep    40 N,  90 E   (western China)
+        logcosh              72 N,  40 W   (Greenland)
 
     and a plain lat-lon southern patch.
 
@@ -1600,9 +1600,9 @@ def build_example_grid(pole_longitude_degree: float = None,
     d2r = np.deg2rad
     dvdj = V_MAX / number_of_rows_in_NH
 
-    if formulation == "logcosh":
+    if formulation == "mi1996":
         default_pole_lon = 90.0
-        fg = FGLogCosh(
+        fg = FGMI1996(
             displaced_north_pole_lat = d2r(40.0),   # mesh north pole latitude
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
             dlat_dv_polar            = d2r(0.01) / dvdj,
@@ -1633,12 +1633,12 @@ def build_example_grid(pole_longitude_degree: float = None,
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
             v_width_f                = V_MAX,
         )
-    elif formulation == "tanh":
+    elif formulation == "logcosh":
         # Mesh pole on the Greenland ice sheet, 72 N / 40 W. The construction
         # always builds it at 90 E, so the grid rotates the whole mesh about the
         # Earth's axis to get it there -- see DisplacedPoleGrid.pole_longitude.
         #
-        # FGTanh takes all four rates as inputs, so feasibility is a condition on
+        # FGLogCosh takes all four rates as inputs, so feasibility is a condition on
         # the whole set, not on s0 alone. Each rate is trapped between its
         # endpoints, so the mean the geometry demands must lie between them:
         #
@@ -1652,7 +1652,7 @@ def build_example_grid(pole_longitude_degree: float = None,
         # equator to 1.607 deg/row, which steepens df/dv in exchange -- C1 ties
         # the two starting rates together, so one branch can be flat but not both.
         default_pole_lon = -40.0
-        fg = FGTanh(
+        fg = FGLogCosh(
             displaced_north_pole_lat = d2r(72.0),
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
             dlat_dv_polar_f          = 1.000000,
@@ -1688,7 +1688,7 @@ def build_example_grid(pole_longitude_degree: float = None,
 
 def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
                            twod_file: str = "grid_displaced_pole_2D.nc",
-                           formulation: str = "logcosh",
+                           formulation: str = "mi1996",
                            mask_land: bool = True, **grid_kwargs):
     """
     Write both output files: the SCRIP grid for ESMF_RegridWeightGen, and a
@@ -1725,7 +1725,7 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
 
 
 def test_plot_grid_naive(output_file: str = None,
-                             formulation: str = "logcosh",
+                             formulation: str = "mi1996",
                              v_min_degree: float = 0.0,
                              **grid_kwargs):
  
@@ -1758,7 +1758,7 @@ def test_plot_grid_naive(output_file: str = None,
     plt.show()
 
 def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None,
-                   formulation: str = "logcosh", **grid_kwargs):
+                   formulation: str = "mi1996", **grid_kwargs):
     """
     Draw the mesh lines on the sphere. Every stride_j-th row and stride_i-th
     column of the assembled mesh is shown, so what is plotted is exactly what
@@ -1794,7 +1794,7 @@ def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None
 
 
 def test_plot_fg_derivatives(output_file: str = None,
-                             formulation: str = "logcosh",
+                             formulation: str = "mi1996",
                              v_min_degree: float = 0.0,
                              **grid_kwargs):
     """
@@ -1921,7 +1921,7 @@ def test_plot_fg_derivatives(output_file: str = None,
 
 
 def test_plot_stereographic(output_file: str = None,
-                            formulation: str = "tanh",
+                            formulation: str = "logcosh",
                             stride_j: int = 2,
                             stride_i: int = 4,
                             max_radius: float = 2.0,
@@ -2024,8 +2024,8 @@ if __name__ == "__main__":
     # (linear, polystep) cap s0 at 2(1 - g_target)/v_max, which is 0.68 for a
     # 40 N pole, so they need a finer equator than the 3 deg default.
     FORMULATIONS = [
-        ("tanh",     dict()),
-        #("logcosh",  dict(v_min_degree=-90.0)),
+        ("logcosh",     dict()),
+        #("mi1996",  dict(v_min_degree=-90.0)),
         #("cubic",    dict()),
         #("polystep", dict(dlat_in_SH_degree=1.5)),
         #("linear",   dict(dlat_in_SH_degree=1.5)),
