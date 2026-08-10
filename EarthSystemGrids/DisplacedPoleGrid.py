@@ -39,42 +39,87 @@ def spherical_to_cartesian(
     z = r * np.sin(lat)
     return np.stack((x, y, z), axis=0)
 
-def integrate_euler_forward(dydt, t0, y0, dt, steps):
+def integrate_euler_forward(dydt, t0, y0, dt, steps, substeps: int = 1):
+    """
+    Forward Euler that records only every `substeps`-th point.
 
+    Each output interval `dt` is covered by `substeps` Euler steps of
+    `dt/substeps`, and the intermediate points are discarded. This decouples
+    accuracy from the spacing of the points you want back: `steps` sets how many
+    values are returned, `substeps` sets how hard the integrator works between
+    them. Useful near the mesh pole, where the ODE stiffens as the J-curve
+    radius shrinks while the rows are still widely spaced in v.
+
+    Forward Euler is first order, so the error falls only linearly in
+    `substeps`; `integrate_rk4` reaches the same accuracy with far fewer
+    right-hand-side evaluations.
+
+    Returns
+    -------
+    t : (steps+1,)
+    y : (dim, steps+1)
+    """
     dim = len(y0)
+    h = dt / substeps
     y = np.zeros((dim, steps+1))
     t = np.zeros((steps+1,))
     t[0] = t0
     y[:, 0] = y0
+
+    y_now = np.array(y0, dtype=float)
+    t_now = float(t0)
     for step in range(steps):
 
-        t[step+1] = t[step] + dt
-        y[:, step+1] = y[:, step] + dydt(t[step], y[:, step]) * dt
+        for _ in range(substeps):
+            y_now = y_now + dydt(t_now, y_now) * h
+            t_now = t_now + h
+
+        t_now = t0 + (step + 1) * dt      # remove accumulated drift
+        t[step+1] = t_now
+        y[:, step+1] = y_now
 
     return t, y
 
-def integrate_rk4(dydt, t0, y0, t_targets, substeps=25):
+def integrate_rk4(dydt, t0, y0, dt, steps, substeps: int = 1):
     """
-    March to each entry of `t_targets` in turn, sub-stepping in between.
+    Classical fourth-order Runge-Kutta, with the same interface as
+    `integrate_euler_forward`: `steps` output intervals of width `dt`, each
+    covered by `substeps` internal steps whose intermediate values are
+    discarded.
 
-    The step size is decoupled from the row spacing, so the rows can be placed
-    wherever the design wants them, and the integrator never has to take a step
-    comparable to the shrinking radius near the pole.
+    Being fourth order, the error falls as substeps^-4 rather than the Euler
+    substeps^-1, so it reaches a given accuracy with far fewer right-hand-side
+    evaluations. That matters near the mesh pole, where the J-curve radius
+    shrinks and the ODE stiffens while the rows are still widely spaced in v.
+
+    Returns
+    -------
+    t : (steps+1,)
+    y : (dim, steps+1)
     """
-    y = np.array(y0, dtype=float)
-    t = float(t0)
-    out = np.zeros((len(y0), len(t_targets)))
-    for k, t_end in enumerate(t_targets):
-        dt = (t_end - t)/substeps
+    dim = len(y0)
+    h = dt / substeps
+    out = np.zeros((dim, steps+1))
+    t = np.zeros((steps+1,))
+    t[0] = t0
+    out[:, 0] = y0
+
+    y_now = np.array(y0, dtype=float)
+    t_now = float(t0)
+    for step in range(steps):
+
         for _ in range(substeps):
-            k1 = dydt(t,          y)
-            k2 = dydt(t + dt/2.0, y + dt/2.0*k1)
-            k3 = dydt(t + dt/2.0, y + dt/2.0*k2)
-            k4 = dydt(t + dt,     y + dt*k3)
-            y = y + dt/6.0*(k1 + 2*k2 + 2*k3 + k4)
-            t = t + dt
-        t = t_end                        # remove accumulated drift
-        out[:, k] = y
+            k1 = dydt(t_now,         y_now)
+            k2 = dydt(t_now + h/2.0, y_now + h/2.0*k1)
+            k3 = dydt(t_now + h/2.0, y_now + h/2.0*k2)
+            k4 = dydt(t_now + h,     y_now + h*k3)
+            y_now = y_now + h/6.0*(k1 + 2*k2 + 2*k3 + k4)
+            t_now = t_now + h
+
+        t_now = t0 + (step + 1) * dt      # remove accumulated drift
+        t[step+1] = t_now
+        out[:, step+1] = y_now
+
     return t, out
 
 
@@ -396,10 +441,14 @@ class DisplacedPoleGrid:
         self.resolution_polar = resolution_polar
         self.resolution_polar_v = resolution_polar_v
         self.number_of_rows_in_NH = number_of_rows_in_NH
+        self.latitude_bounds_in_SH = np.asarray(latitude_bounds_in_SH, dtype=float)
         self.number_of_columns = number_of_columns
-       
-        self.v_bounds = np.linspace(-np.pi/2, np.pi/2, number_of_rows_in_NH+1)
-        self.dvdj = np.pi / number_of_rows_in_NH
+
+        # The northern branch is the only part parameterised by v, and it spans
+        # the equator to the mesh pole, v in [0, pi/2]. The southern hemisphere
+        # is a plain lat-lon patch placed directly by latitude_bounds_in_SH.
+        self.v_bounds = np.linspace(0.0, np.pi/2, number_of_rows_in_NH + 1)
+        self.dvdj = (np.pi/2) / number_of_rows_in_NH
     
         self.solve_for_coefficients()
 
@@ -505,7 +554,119 @@ class DisplacedPoleGrid:
         self.A1          = x[0]
         self.W_polar_f   = x[1]
         self.W_tropics_f = x[2]
- 
+
+        self.verify_coefficients()
+        
+    def verify_coefficients(self, tolerance: float = 1e-9, samples: int = 2001,
+                            verbose: bool = True, raise_on_failure: bool = False):
+        """
+        Check that the solved coefficients do what they were solved for.
+
+        Two separate things are tested:
+
+        1. The seven boundary conditions imposed by solve_for_coefficients().
+           These are the output of a linear solve, so they should hold to
+           machine precision; a failure here means the system was assembled
+           wrongly (a beta where a dbeta_dv belongs, a sign, a stale name).
+
+        2. The structural properties those conditions are supposed to buy,
+           which are NOT automatic. Satisfying all seven and still producing an
+           unusable grid is the normal failure mode: f can fold back, the
+           circles can stop being embedded, or the pole can miss its target.
+           These correspond to properties (a)-(e) of Madec and Imbard (1996).
+
+        Only the northern branch, v in [0, pi/2], is examined. The southern
+        hemisphere is a lat-lon patch placed by latitude_bounds_in_SH and does
+        not use f or g.
+
+        Parameters
+        ----------
+        tolerance        : absolute tolerance for the boundary conditions.
+        samples          : how densely to sample v when testing monotonicity.
+        verbose          : print a table of every check.
+        raise_on_failure : raise AssertionError instead of returning False.
+
+        Returns
+        -------
+        True if every check passes.
+        """
+        _, y_NP = spherical_to_stereo(np.pi/2, self.displaced_north_pole_lat)
+        v_star  = -np.abs(self.resolution_polar_v)
+        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
+        s0     = self.grid_resolution_to_dfdv(self.resolution_equator, f=-1.0)
+        s_star = self.grid_resolution_to_dfdv(self.resolution_polar, f=y_star)
+
+        v = np.linspace(0.0, np.pi/2, samples)
+        f_v    = np.array([self.f(vv)    for vv in v])
+        g_v    = np.array([self.g(vv)    for vv in v])
+        dfdv_v = np.array([self.dfdv(vv) for vv in v])
+        dgdv_v = np.array([self.dgdv(vv) for vv in v])
+        radius = (g_v - f_v) / 2.0
+
+        # latitude the mesh pole actually lands on, and the spacing actually
+        # delivered at the equator, both in degrees
+        pole_lat = np.rad2deg(np.pi/2 - 2*np.arctan(np.abs((f_v[-1] + g_v[-1])/2.0)))
+        eq_spacing = np.rad2deg(abs(dgdv_v[0]) * self.dvdj * 2.0/(1.0 + g_v[0]**2))
+
+        checks = [
+            # name                         measured            expected        kind
+            ("(a) radius > 0 for v < pi/2", radius[:-1].min(), 0.0,            "gt"),
+            ("(b) f strictly increasing",  dfdv_v.min(),       0.0,            "gt"),
+            ("(b) g strictly decreasing",  dgdv_v.max(),       0.0,            "lt"),
+            ("(c) pole closes: f-g = 0",   f_v[-1] - g_v[-1],  0.0,            "eq"),
+            ("(1) f(0) = -1",              self.f(0.0),        -1.0,           "eq"),
+            ("(2) g(0) = +1",              self.g(0.0),        1.0,            "eq"),
+            ("(3) dfdv(0) = s0",           self.dfdv(0.0),     s0,             "eq"),
+            ("(4) dgdv(0) = -s0",          self.dgdv(0.0),     -s0,            "eq"),
+            ("(5) f(pi/2) = y_NP",         self.f(np.pi/2),    y_NP,           "eq"),
+            ("(6) g(pi/2) = y_NP",         self.g(np.pi/2),    y_NP,           "eq"),
+
+            ("(r2) dfdv(v_star) = s_star", self.dfdv(v_star),  s_star,         "eq"),
+            ("C1 at equator: f'+g' = 0",   self.dfdv(0.0) + self.dgdv(0.0), 0.0, "eq"),
+            ("pole latitude [deg]",        pole_lat,
+             np.rad2deg(self.displaced_north_pole_lat),                        "eq_loose"),
+            ("equator spacing [deg/row]",  eq_spacing,
+             np.rad2deg(self.resolution_equator),                              "eq_loose"),
+            ("Design: W_polar_f   > 0",    self.W_polar_f,     0.0,            "gt"),
+            ("Design: W_tropics_f > 0",    self.W_tropics_f,     0.0,            "gt"),
+            ("Design: W_g         > 0",    self.W_g,     0.0,            "gt"),
+        ]
+
+        ok = True
+        rows = []
+        for name, got, want, kind in checks:
+            if kind == "eq":
+                passed = abs(got - want) <= tolerance
+                detail = f"{got:+14.9f}  want {want:+14.9f}  err {abs(got-want):.1e}"
+            elif kind == "eq_loose":
+                passed = abs(got - want) <= 1e-6 * max(1.0, abs(want))
+                detail = f"{got:+14.9f}  want {want:+14.9f}  err {abs(got-want):.1e}"
+            elif kind == "gt":
+                passed = got > 0.0
+                detail = f"min {got:+14.9f}  must be > 0"
+            else:
+                passed = got < 0.0
+                detail = f"max {got:+14.9f}  must be < 0"
+            ok = ok and passed
+            rows.append((passed, name, detail))
+
+        if verbose:
+            print("verify_coefficients:")
+            for passed, name, detail in rows:
+                print(f"   [{'ok' if passed else 'FAIL'}] {name:30s} {detail}")
+            print(f"   -> {'all checks passed' if ok else 'FAILURES ABOVE'}")
+            if ok:
+                print(f"   note: the dfdv(v_star) condition shapes f at v = "
+                      f"{np.rad2deg(v_star):.1f} deg, which the mesh no longer "
+                      f"uses;\n         with the lat-lon southern patch it is a "
+                      f"shape knob, not a resolution.")
+
+        if raise_on_failure and not ok:
+            failed = [name for passed, name, _ in rows if not passed]
+            raise AssertionError("verify_coefficients failed: " + ", ".join(failed))
+
+        return ok
+
     def generate_J_curve(
         self,
         v: float,
@@ -544,7 +705,7 @@ class DisplacedPoleGrid:
     def generate_I_curve(
         self,
         u: float,
-        split: int = 100, 
+        split: int = 10, 
     ):
         """
         Compute the I curve (mesh zonal circle) given the mesh longitude u.
@@ -558,71 +719,547 @@ class DisplacedPoleGrid:
         # The mesh north pole is at v = pi/2, where f = g and the J-curve
         # degenerates to a point: |grad phi|^2 -> 0 and the ODE is 0/0 there.
         # Stop one row short so the integration never reaches it.
-        number_of_grids = self.number_of_rows_in_NH // 2 - 1
-        integration_steps = number_of_grids * split
-        dv = np.pi/2 / (integration_steps + split)
+        number_of_grids = self.number_of_rows_in_NH - 1
+        _, pts_xy = integrate_euler_forward(_I_curve_ray_tracing_system, 0.0, [x0, y0],
+                                            self.dvdj, number_of_grids, substeps=split)
 
-        _, pts_xy = integrate_euler_forward(_I_curve_ray_tracing_system, 0.0, [x0, y0], dv, integration_steps)
-
-        lon, lat = stereo_to_spherical(pts_xy[0, ::split], pts_xy[1, ::split])
+        lon, lat = stereo_to_spherical(pts_xy[0, :], pts_xy[1, :])
         pts = np.zeros((2, number_of_grids + 1))
         pts[0, :] = lon
         pts[1, :] = lat
 
         return pts
 
-if __name__ == "__main__":
+    def generate_mesh(self, latitude_bounds_in_SH=None, v_interfaces_in_NH=None,
+                      split: int = 5, earth_radius: float = 6371.0e3):
+        """
+        Assemble the full cell mesh: centres, corners, scale factors and areas.
 
+        Points are computed on a doubled grid, so that row/column interfaces
+        sit at even indices and cell centres at odd ones. Cell (j, i) then has
+        its centre at [2j+1, 2i+1] and its four corners at [2j, 2i],
+        [2j, 2i+2], [2j+2, 2i+2], [2j+2, 2i].
+
+        The two hemispheres are built by different routes, because they are
+        different problems:
+
+        - South: the J-curves are concentric circles, so they are true latitude
+          circles and the orthogonal trajectories are true meridians. Rows are
+          placed directly at the latitudes in `latitude_bounds_in_SH` and every
+          point follows in closed form, radius = tan(pi/4 - lat/2). No ODE.
+        - North: the circles are displaced, so each I-curve is obtained by
+          integrating I_curve_ray_tracing_system up from the equator with RK4,
+          sampling every required v in a single pass.
+
+        The equator is shared: it is the last southern interface and the first
+        northern one, and both routes put it on the unit circle, so the two
+        halves join without a seam in the mesh lines.
+
+        Parameters
+        ----------
+        latitude_bounds_in_SH : ascending latitudes [rad] of the southern row
+                                edges, ending at 0. Defaults to the value given
+                                to __init__.
+        v_interfaces_in_NH    : northern row edges in v [rad], ascending from 0.
+                                Defaults to linspace(0, pi/2, nj_NH+1) with the
+                                topmost edge dropped: there f = g, the J-curve
+                                degenerates to a point, and the ray-tracing ODE
+                                is 0/0.
+        split                 : RK4 substeps between consecutive v targets.
+        earth_radius          : used only for e1 and e2, in metres.
+
+        Returns
+        -------
+        DisplacedPoleMesh
+        """
+        if latitude_bounds_in_SH is None:
+            latitude_bounds_in_SH = self.latitude_bounds_in_SH
+        latitude_bounds_in_SH = np.asarray(latitude_bounds_in_SH, dtype=float)
+
+        if v_interfaces_in_NH is None:
+            v_interfaces_in_NH = np.linspace(0.0, np.pi/2, self.number_of_rows_in_NH + 1)[:-1]
+        v_interfaces_in_NH = np.asarray(v_interfaces_in_NH, dtype=float)
+
+        ni = self.number_of_columns
+        nj_S = latitude_bounds_in_SH.size - 1
+        nj_N = v_interfaces_in_NH.size - 1
+        nj = nj_S + nj_N
+
+        # doubled row coordinates, interface / centre / interface / ...
+        lat_all = np.empty(2*nj_S + 1)
+        lat_all[0::2] = latitude_bounds_in_SH
+        lat_all[1::2] = 0.5*(latitude_bounds_in_SH[:-1] + latitude_bounds_in_SH[1:])
+
+        v_all = np.empty(2*nj_N + 1)
+        v_all[0::2] = v_interfaces_in_NH
+        v_all[1::2] = 0.5*(v_interfaces_in_NH[:-1] + v_interfaces_in_NH[1:])
+
+        print("v_all = ", v_all)
+
+        # doubled column coordinates, periodic
+        du = 2.0*np.pi/ni
+        u_all = np.arange(2*ni) * (du/2.0)
+
+        # southern radii in closed form; the shared equator row is dropped from
+        # the northern block so it is not written twice
+        radius_S = np.tan(np.pi/4 - lat_all/2.0)
+        # integrate_rk4 marches in uniform steps, so the northern row edges must
+        # be evenly spaced in v. The doubled array then advances by half a row.
+        dv_doubled = np.diff(v_all)
+        if not np.allclose(dv_doubled, dv_doubled[0]):
+            raise ValueError("v_interfaces_in_NH must be uniformly spaced in v")
+        dv_doubled = dv_doubled[0]
+        print(f"dv_doubled = {dv_doubled}")
+        n_steps_N = v_all.size - 1
+
+        I_curve_generator = functools.partial(I_curve_ray_tracing_system, FG_funcs=self)
+
+        n_rows_doubled = (2*nj_S + 1) + (2*nj_N)
+        x = np.zeros((n_rows_doubled, 2*ni))
+        y = np.zeros_like(x)
+        split_at = 2*nj_S + 1
+        for b, u in enumerate(u_all):
+            x[:split_at, b] = radius_S*np.cos(u)
+            y[:split_at, b] = radius_S*np.sin(u)
+            if n_steps_N:
+                # out[:, 0] is the equator, already covered by the southern
+                # block above, so it is dropped here rather than written twice.
+                _, out = integrate_rk4(I_curve_generator, 0.0, [np.cos(u), np.sin(u)],
+                                       dv_doubled, n_steps_N, substeps=split)
+                x[split_at:, b] = out[0, 1:]
+                y[split_at:, b] = out[1, 1:]
+
+        lon, lat = stereo_to_spherical(x, y)
+
+        rows_edge   = np.arange(nj) * 2
+        rows_edge_1 = rows_edge + 2
+        rows_ctr    = rows_edge + 1
+        cols_edge   = np.arange(ni) * 2
+        cols_edge_1 = (cols_edge + 2) % (2*ni)
+        cols_ctr    = cols_edge + 1
+
+        center_lon = lon[np.ix_(rows_ctr, cols_ctr)]
+        center_lat = lat[np.ix_(rows_ctr, cols_ctr)]
+
+        corner_lon = np.zeros((nj, ni, 4))
+        corner_lat = np.zeros((nj, ni, 4))
+        for k, (rr, cc) in enumerate([(rows_edge,   cols_edge),
+                                      (rows_edge,   cols_edge_1),
+                                      (rows_edge_1, cols_edge_1),
+                                      (rows_edge_1, cols_edge)]):
+            corner_lon[:, :, k] = lon[np.ix_(rr, cc)]
+            corner_lat[:, :, k] = lat[np.ix_(rr, cc)]
+
+        # scale factors straight off the doubled mesh: the mid-edge points are
+        # already there, so no interpolation or finite differencing is needed.
+        e1 = _great_circle(lon[np.ix_(rows_ctr, cols_edge)],   lat[np.ix_(rows_ctr, cols_edge)],
+                           lon[np.ix_(rows_ctr, cols_edge_1)], lat[np.ix_(rows_ctr, cols_edge_1)],
+                           earth_radius)
+        e2 = _great_circle(lon[np.ix_(rows_edge, cols_ctr)],   lat[np.ix_(rows_edge, cols_ctr)],
+                           lon[np.ix_(rows_edge_1, cols_ctr)], lat[np.ix_(rows_edge_1, cols_ctr)],
+                           earth_radius)
+
+        area = _spherical_excess(np.moveaxis(corner_lon, 2, 0),
+                                 np.moveaxis(corner_lat, 2, 0))
+
+        return DisplacedPoleMesh(
+            center_lon = center_lon,
+            center_lat = center_lat,
+            corner_lon = corner_lon,
+            corner_lat = corner_lat,
+            e1 = e1,
+            e2 = e2,
+            area = area,
+            mask = np.ones((nj, ni), dtype=np.int32),
+            number_of_rows_in_SH = nj_S,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mesh assembly and file output
+# ---------------------------------------------------------------------------
+
+def _unit_vectors(lon, lat):
+    """Cartesian unit vectors on the sphere from radian lon/lat."""
+    return np.stack((
+        np.cos(lat) * np.cos(lon),
+        np.cos(lat) * np.sin(lon),
+        np.sin(lat),
+    ), axis=0)
+
+
+def _great_circle(lon1, lat1, lon2, lat2, radius: float = 1.0):
+    """Great-circle distance between two points, in the units of `radius`."""
+    a = _unit_vectors(lon1, lat1)
+    b = _unit_vectors(lon2, lat2)
+    return radius * np.arccos(np.clip(np.sum(a * b, axis=0), -1.0, 1.0))
+
+
+def _spherical_excess(lon, lat):
+    """
+    Exact solid angle of spherical quadrilaterals bounded by great-circle arcs.
+
+    The cell is split into two triangles and each is evaluated with the
+    l'Huilier-free formula of Van Oosterom and Strackee (1983), which stays
+    accurate for the very thin slivers that appear next to the mesh pole.
+
+    Parameters
+    ----------
+    lon, lat : (4, ...) arrays, corners ordered around the cell.
+
+    Returns
+    -------
+    Solid angle in steradians, shape (...).
+
+    Note this is NOT renormalised to 4 pi: a displaced pole mesh that stops
+    short of the pole does not cover the whole sphere, so the unnormalised
+    value is the correct one. It is also what ESMF_RegridWeightGen assumes,
+    since it treats cell edges as great-circle arcs.
+    """
+    v = _unit_vectors(lon, lat)
+
+    def triangle(a, b, c):
+        numerator = np.abs(np.sum(a * np.cross(b, c, axis=0), axis=0))
+        denominator = (1.0
+                       + np.sum(a * b, axis=0)
+                       + np.sum(b * c, axis=0)
+                       + np.sum(c * a, axis=0))
+        return 2.0 * np.arctan2(numerator, denominator)
+
+    return (triangle(v[:, 0], v[:, 1], v[:, 2])
+            + triangle(v[:, 0], v[:, 2], v[:, 3]))
+
+
+class DisplacedPoleMesh:
+    """
+    A concrete set of cells produced by DisplacedPoleGrid.generate_mesh().
+
+    All longitudes and latitudes are in radians. Corners are ordered
+    counter-clockwise starting from the (v_low, u_low) corner, which is the
+    ordering ESMF_RegridWeightGen expects.
+
+    Attributes
+    ----------
+    center_lon, center_lat : (nj, ni)
+    corner_lon, corner_lat : (nj, ni, 4)
+    e1, e2                 : (nj, ni) zonal and meridional scale factors [m]
+    area                   : (nj, ni) solid angle [steradian]
+    mask                   : (nj, ni) int, 1 = active
+    number_of_rows_in_SH   : rows below the equator (the lat-lon patch)
+    """
+
+    def __init__(self, center_lon, center_lat, corner_lon, corner_lat,
+                 e1, e2, area, mask, number_of_rows_in_SH):
+        self.center_lon = center_lon
+        self.center_lat = center_lat
+        self.corner_lon = corner_lon
+        self.corner_lat = corner_lat
+        self.e1 = e1
+        self.e2 = e2
+        self.area = area
+        self.mask = mask
+        self.number_of_rows_in_SH = number_of_rows_in_SH
+
+    @property
+    def shape(self):
+        return self.center_lon.shape
+
+
+def write_to_SCRIP_grid_file(mesh: DisplacedPoleMesh, output_file, flatten: bool = True):
+    """
+    Write `mesh` as a SCRIP grid file, readable by ESMF_RegridWeightGen.
+
+    With flatten=True the cells are collapsed onto a single `grid_size`
+    dimension and written in degrees, which is the portable form. With
+    flatten=False the (lat, lon) structure is kept and radians are used,
+    which is easier to inspect but relies on the reader honouring grid_dims.
+    """
+    import xarray as xr
+
+    nj, ni = mesh.shape
+    grid_corners = 4
+
+    # ESMF_RegridWeightGen reads grid_dims in the reverse of the array order.
+    # This is undocumented in the user manual; see also JCMGrid.py.
+    grid_dims = [ni, nj]
+    grid_dim_names = ["lat", "lon"]
+
+    rad2deg = 180.0 / np.pi
+
+    if flatten:
+        ds = xr.Dataset(
+            data_vars = dict(
+                grid_dims       = ( ["grid_rank", ], grid_dims),
+                grid_imask      = ( ["grid_size", ], mesh.mask.flatten()),
+                grid_center_lat = ( ["grid_size", ], mesh.center_lat.flatten() * rad2deg, {"units" : "degrees"} ),
+                grid_center_lon = ( ["grid_size", ], mesh.center_lon.flatten() * rad2deg, {"units" : "degrees"} ),
+                grid_corner_lat = ( ["grid_size", "grid_corners"], mesh.corner_lat.reshape((-1, grid_corners)) * rad2deg, {"units" : "degrees"} ),
+                grid_corner_lon = ( ["grid_size", "grid_corners"], mesh.corner_lon.reshape((-1, grid_corners)) * rad2deg, {"units" : "degrees"} ),
+                grid_area       = ( ["grid_size", ], mesh.area.flatten(), {"units" : "radians^2"} ),
+            ),
+        )
+    else:
+        ds = xr.Dataset(
+            data_vars = dict(
+                grid_dims       = ( ["grid_rank", ], grid_dims),
+                grid_imask      = ( [*grid_dim_names], mesh.mask),
+                grid_center_lat = ( [*grid_dim_names], mesh.center_lat, {"units" : "radians"} ),
+                grid_center_lon = ( [*grid_dim_names], mesh.center_lon, {"units" : "radians"} ),
+                grid_corner_lat = ( [*grid_dim_names, "grid_corners"], mesh.corner_lat, {"units" : "radians"} ),
+                grid_corner_lon = ( [*grid_dim_names, "grid_corners"], mesh.corner_lon, {"units" : "radians"} ),
+                grid_area       = ( [*grid_dim_names], mesh.area, {"units" : "radians^2"} ),
+            ),
+        )
+
+    ds.attrs["title"] = "Displaced pole grid (Madec and Imbard, 1996)"
+    ds.to_netcdf(output_file)
+
+
+def write_to_2D_grid_file(mesh: DisplacedPoleMesh, output_file):
+    """
+    Write `mesh` as a plain 2D (j, i) file for quick inspection in ncview.
+
+    ncview cannot read the SCRIP layout, which flattens every cell onto one
+    dimension. Here each field keeps its (j, i) shape and carries a
+    `coordinates = "lon lat"` attribute, so ncview will offer lon/lat as
+    curvilinear axes and every diagnostic can be displayed as an image.
+    """
+    import xarray as xr
+
+    nj, ni = mesh.shape
+    ratio = np.maximum(mesh.e1 / mesh.e2, mesh.e2 / mesh.e1)
+    rad2deg = 180.0 / np.pi
+
+    coords = {"j": np.arange(nj), "i": np.arange(ni)}
+    field = lambda data, units, long_name: (
+        ["j", "i"], data, {"units": units, "long_name": long_name, "coordinates": "lon lat"}
+    )
+
+    ds = xr.Dataset(
+        data_vars = dict(
+            lon        = ( ["j", "i"], mesh.center_lon * rad2deg, {"units": "degrees_east",  "long_name": "cell centre longitude"} ),
+            lat        = ( ["j", "i"], mesh.center_lat * rad2deg, {"units": "degrees_north", "long_name": "cell centre latitude"} ),
+            e1         = field(mesh.e1 / 1.0e3, "km",         "zonal scale factor"),
+            e2         = field(mesh.e2 / 1.0e3, "km",         "meridional scale factor"),
+            anisotropy = field(ratio,           "1",          "max(e1/e2, e2/e1)"),
+            area       = field(mesh.area,       "steradian",  "cell solid angle"),
+            mask       = field(mesh.mask,       "1",          "1 = active cell"),
+        ),
+        coords = coords,
+    )
+    ds.attrs["title"] = "Displaced pole grid (Madec and Imbard, 1996), 2D view for ncview"
+    ds.to_netcdf(output_file)
+
+
+def build_example_grid(number_of_rows_in_NH: int = 30,
+                       number_of_columns: int = 120,
+                       dlat_in_SH_degree: float = 3.0,
+                       southern_edge_degree: float = -90.0):
+    """
+    A worked example: mesh pole over China at 40 N / 90 E, tropical refinement,
+    and a plain lat-lon southern patch.
+
+    dlat_in_SH_degree is also used as the equatorial meridional resolution, so
+    that e2 is continuous across the equator. That is the one condition the
+    southern patch has to respect; see the note in generate_mesh.
+    """
     d2r = np.deg2rad
-
-    displaced_pole_grid = DisplacedPoleGrid(
+    return DisplacedPoleGrid(
         displaced_north_pole_lat = d2r(40.0),   # mesh north pole latitude
         v_trans_tropics_f        = d2r(20.0),   # tropical refinement knee, f
         v_trans_width_tropics_f  = d2r(10.0),
         v_trans_polar_f          = d2r(70.0),   # polar knee, f
         v_trans_width_polar_f    = d2r(10.0),
-        v_trans_g                = d2r(40.0),   # polar knee, g
-        v_trans_g_width          = d2r( 6.0),
-        resolution_equator       = d2r( 3.0),   # [rad/grid] meridional, at the equator
-        resolution_polar         = d2r( 3.0),   # [rad/grid] meridional, at resolution_polar_v
-        resolution_polar_v       = d2r(-30.0),  # where resolution_polar applies
-        number_of_rows_in_NH     = 30,
-        latitude_bounds_in_SH    = d2r(np.linspace(-90, 0, 31)),
-        number_of_columns        = 180,
+        v_trans_g                = d2r(30.0),   # polar knee, g
+        v_trans_g_width          = d2r(10.0),
+        resolution_equator       = d2r(dlat_in_SH_degree),
+        resolution_polar         = d2r(0.01),
+        resolution_polar_v       = d2r(-85),
+        number_of_rows_in_NH     = number_of_rows_in_NH,
+        # stop short of -90: there all meridians converge and e1 -> 0, the
+        # ordinary lat-lon pole singularity. Antarctica covers the remainder.
+        latitude_bounds_in_SH    = d2r(np.arange(southern_edge_degree, 1e-9,
+                                                 dlat_in_SH_degree)),
+        number_of_columns        = number_of_columns,
     )
 
-    print(f"A1 = {displaced_pole_grid.A1:+.6f}   "
-          f"W_polar_f = {displaced_pole_grid.W_polar_f:+.6f}   "
-          f"W_tropics_f = {displaced_pole_grid.W_tropics_f:+.6f}")
-    print(f"B1 = {displaced_pole_grid.B1:+.6f}   "
-          f"W_g = {displaced_pole_grid.W_g:+.6f}")
 
-    # v = +pi/2 is the mesh north pole, where the J-curve is a single point,
-    # so stop just short of both ends when drawing.
-    v_draw = np.linspace(-np.pi/2, np.pi/2, 30)[1:-1]
-    J_curves = [spherical_to_cartesian(displaced_pole_grid.generate_J_curve(v))
-                for v in v_draw]
-    I_curves = [spherical_to_cartesian(displaced_pole_grid.generate_I_curve(u))
-                for u in np.linspace(0.0, 2*np.pi, 13)[:-1]]
+def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
+                           twod_file: str = "grid_displaced_pole_2D.nc"):
+    """
+    Write both output files: the SCRIP grid for ESMF_RegridWeightGen, and a
+    plain (j, i) file that ncview can display directly.
+    """
+    print("Generating grid...")
+    grid = build_example_grid()
+    print(f"  A1 = {grid.A1:+.6f}   W_polar_f = {grid.W_polar_f:+.6f}   "
+          f"W_tropics_f = {grid.W_tropics_f:+.6f}")
+    print(f"  B1 = {grid.B1:+.6f}   W_g = {grid.W_g:+.6f}")
 
+    print("Assembling mesh...")
+    mesh = grid.generate_mesh()
+    nj, ni = mesh.shape
+    print(f"  {nj} x {ni} cells, {mesh.number_of_rows_in_SH} of them south of the equator")
+    print(f"  latitude {np.rad2deg(mesh.center_lat.min()):+.2f} .. "
+          f"{np.rad2deg(mesh.center_lat.max()):+.2f} deg")
+    print(f"  e1 {mesh.e1.min()/1e3:.1f} .. {mesh.e1.max()/1e3:.1f} km, "
+          f"e2 {mesh.e2.min()/1e3:.1f} .. {mesh.e2.max()/1e3:.1f} km")
+    print(f"  total solid angle {mesh.area.sum():.6f} sr")
+
+    print("Writing to file: ", scrip_file)
+    write_to_SCRIP_grid_file(mesh, scrip_file)
+
+    print("Writing to file: ", twod_file)
+    write_to_2D_grid_file(mesh, twod_file)
+
+
+def test_plot_grid_naive():
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1, 1, subplot_kw={'projection': '3d'})
+
+    grid = build_example_grid()
+
+    start_lons = np.deg2rad([0, 90, 180, 270])
+    I_curves = [ grid.generate_I_curve(lon) for lon in start_lons ]
+
+    fig, ax = plt.subplots(1, 1, subplot_kw={"projection": "3d"})
     ax.view_init(azim=-30, elev=45, roll=0)
 
-    ax.scatter(0, 0, 0, color="red", s=10)
-
-    for i, I_curve in enumerate(I_curves):
-        ax.scatter(I_curve[0, :], I_curve[1, :], I_curve[2, :], s=4)
-
-    for j, J_curve in enumerate(J_curves):
-        ax.scatter(J_curve[0, :], J_curve[1, :], J_curve[2, :], marker="s", s=2)
+    for i, pts in enumerate(I_curves):
+        xyz = spherical_to_cartesian(pts)
+        x = xyz[0, :]
+        y = xyz[1, :]
+        z = xyz[2, :]
+        ax.plot(x, y, z, lw=0.9)
 
     ax.set_xlabel("x-direction")
     ax.set_ylabel("y-direction")
     ax.set_zlabel("z-direction")
-
-    lim = np.array([-1, 1])*1.5
-    ax.set_xlim(lim)
-    ax.set_ylim(lim)
-    ax.set_zlim(lim)
+    lim = np.array([-1, 1]) * 1.1
+    ax.set_xlim(lim); ax.set_ylim(lim); ax.set_zlim(lim)
     plt.show()
+
+def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None):
+    """
+    Draw the mesh lines on the sphere. Every stride_j-th row and stride_i-th
+    column of the assembled mesh is shown, so what is plotted is exactly what
+    gets written to file.
+    """
+    import matplotlib.pyplot as plt
+
+    grid = build_example_grid()
+    mesh = grid.generate_mesh()
+    lon = mesh.corner_lon[:, :, 0]
+    lat = mesh.corner_lat[:, :, 0]
+    xyz = spherical_to_cartesian(np.stack((lon.ravel(), lat.ravel()), axis=0))
+    x, y, z = (c.reshape(lon.shape) for c in xyz)
+    print("lon.shape = ", lon.shape)
+    fig, ax = plt.subplots(1, 1, subplot_kw={"projection": "3d"})
+    ax.view_init(azim=-30, elev=45, roll=0)
+    for j in range(0, lon.shape[0], stride_j):              # J-curves
+        ax.plot(np.append(x[j], x[j, 0]), np.append(y[j], y[j, 0]),
+                np.append(z[j], z[j, 0]), lw=0.6, color="0.45")
+    for i in range(0, lon.shape[1], stride_i):              # I-curves
+        ax.plot(x[:, i], y[:, i], z[:, i], lw=0.9)
+
+    ax.set_xlabel("x-direction")
+    ax.set_ylabel("y-direction")
+    ax.set_zlabel("z-direction")
+    lim = np.array([-1, 1]) * 1.1
+    ax.set_xlim(lim); ax.set_ylim(lim); ax.set_zlim(lim)
+    if output_file is None:
+        plt.show()
+    else:
+        plt.savefig(output_file, dpi=110, bbox_inches="tight")
+        print("Wrote plot: ", output_file)
+
+
+def test_plot_fg_derivatives(output_file: str = None):
+    """
+    Plot df/dv and dg/dv against v, the analogue of Fig. 2 of Madec and Imbard
+    (1996), where the envelope of the e2 curves is exactly these derivatives.
+
+    Two panels, because the two quantities answer different questions:
+
+    - top: the raw shape derivatives. These are what solve_for_coefficients()
+      pins, so the boundary conditions are directly readable off the axes.
+    - bottom: the same information converted to meridional grid spacing in
+      degrees per row, via dlat/dj = |d/dv| * 2/(1 + w^2) * dv/dj. That factor
+      is not close to 1 away from the equator, so the two panels do not have
+      the same shape, and the bottom one is the one to judge resolution by.
+
+    v < 0 is shaded: f and g are still defined there and the dfdv(v_star)
+    condition still acts there, but the mesh no longer uses them, since the
+    southern hemisphere is the lat-lon patch.
+    """
+    import matplotlib.pyplot as plt
+
+    grid = build_example_grid()
+    r2d = np.rad2deg
+
+    v_star = -np.abs(grid.resolution_polar_v)
+    v = np.linspace(-np.pi/2, np.pi/2, 1201)
+    dfdv = np.array([grid.dfdv(vv) for vv in v])
+    dgdv = np.array([grid.dgdv(vv) for vv in v])
+    f_v  = np.array([grid.f(vv) for vv in v])
+    g_v  = np.array([grid.g(vv) for vv in v])
+
+    # ordinate rate -> meridional spacing in degrees per row
+    to_deg_per_row = lambda d, w: r2d(np.abs(d) * 2.0/(1.0 + w**2) * grid.dvdj)
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+
+    ax = axes[0]
+    ax.plot(r2d(v), dfdv, label="df/dv", lw=1.6)
+    ax.plot(r2d(v), dgdv, label="dg/dv", lw=1.6)
+    ax.axhline(0.0, color="0.7", lw=0.8)
+    s0 = grid.grid_resolution_to_dfdv(grid.resolution_equator, f=-1.0)
+    ax.plot([0, 0], [s0, -s0], "k.", ms=8, zorder=5)
+    ax.annotate(f"  f'(0) = +s0 = {s0:.4f}", (0, s0), fontsize=8, va="bottom")
+    ax.annotate(f"  g'(0) = -s0", (0, -s0), fontsize=8, va="top")
+    ax.set_ylabel("d/dv  [stereographic radius per rad of v]")
+    ax.set_title("Shape derivatives (what the boundary conditions pin)")
+    ax.legend(loc="upper left", fontsize=9)
+
+    ax = axes[1]
+    ax.plot(r2d(v), to_deg_per_row(dfdv, f_v), label="f branch (lon 270 / 90)", lw=1.6)
+    ax.plot(r2d(v), to_deg_per_row(dgdv, g_v), label="g branch (lon 90)", lw=1.6)
+    ax.axhline(r2d(grid.resolution_equator), color="0.5", ls=":", lw=1.0,
+               label="resolution_equator")
+    ax.set_ylabel("meridional spacing  [deg / row]")
+    ax.set_xlabel("v  [deg]")
+    ax.set_title("Same thing as grid resolution (paper Fig. 2)")
+    ax.legend(loc="upper left", fontsize=9)
+
+    for ax in axes:
+        ax.axvspan(r2d(v[0]), 0.0, color="0.9", zorder=0)
+        ax.annotate("not used by the mesh\n(lat-lon patch)", (r2d(v[0]) * 0.95, ax.get_ylim()[1]),
+                    fontsize=7, color="0.4", va="top")
+        for vt, name, colour in [(grid.v_trans_tropics_f, "v_trans_tropics_f", "C0"),
+                                 (grid.v_trans_polar_f,   "v_trans_polar_f",   "C0"),
+                                 (grid.v_trans_g,         "v_trans_g",         "C1")]:
+            ax.axvline(r2d(vt), color=colour, ls="--", lw=0.7, alpha=0.5)
+        ax.axvline(r2d(v_star), color="k", ls="-.", lw=0.7, alpha=0.6)
+        ax.axvline(90.0, color="k", lw=0.8, alpha=0.6)
+        ax.grid(alpha=0.25)
+
+    axes[0].annotate("v_star", (r2d(v_star), axes[0].get_ylim()[0]), fontsize=7,
+                     rotation=90, va="bottom", ha="right")
+    axes[0].annotate("mesh pole", (90.0, axes[0].get_ylim()[0]), fontsize=7,
+                     rotation=90, va="bottom", ha="right")
+
+    fig.tight_layout()
+    if output_file is None:
+        plt.show()
+    else:
+        plt.savefig(output_file, dpi=110, bbox_inches="tight")
+        print("Wrote plot: ", output_file)
+
+
+if __name__ == "__main__":
+
+    print("Plotting grid...")
+    test_plot_fg_derivatives(output_file="figure_fg_derivative.png")
+    test_plot_grid_naive()
+    test_plot_grid()
+    test_output_SCRIP_file()
+
