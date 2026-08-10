@@ -350,10 +350,29 @@ class FGBase(abc.ABC):
     `_scheme_checks` and `transition_marks`.
     """
 
-    def __init__(self, displaced_north_pole_lat, dlat_dv_equator):
+    def __init__(self, displaced_north_pole_lat, dlat_dv_equator, ring_radius=0.0):
         self.displaced_north_pole_lat = displaced_north_pole_lat
         self.v_max = V_MAX
         _, self.y_NP = spherical_to_stereo(np.pi/2, displaced_north_pole_lat)
+
+        # Madec and Imbard's condition (c) closes the mesh pole exactly,
+        # f(v_max) = g(v_max), which leaves the last J-curve a single point:
+        # number_of_columns coincident cells, an undefined e1, and |grad phi|^2
+        # -> 0 so the I-curve ODE is 0/0 there. The paper does not impose (c)
+        # either -- it truncates and notes the remainder is on land. ring_radius
+        # is that truncation: the last J-curve keeps radius R about the pole.
+        #
+        # It costs headroom. Opening the ring raises g_target, so g has less
+        # distance to cover while C1 still forces it to start at s0, and the
+        # limit s0 < 2(1 - g_target)/v_max tightens by roughly 1.3 R.
+        self.ring_radius = ring_radius
+        self.f_target = self.y_NP - ring_radius
+        self.g_target = self.y_NP + ring_radius
+        if ring_radius >= abs(self.y_NP):
+            raise ValueError(
+                f"ring_radius {ring_radius:.4f} must stay below |y_NP| = "
+                f"{abs(self.y_NP):.4f}, otherwise the hole swallows the origin "
+                f"and the GEOGRAPHIC north pole falls outside the mesh.")
         # At the equator f = -1, so the Jacobian 2/(1+f^2) is exactly 1 and this
         # reduces to s0 = dlat_dv_equator. Written through the general
         # conversion anyway, so there is only one code path.
@@ -471,10 +490,10 @@ class FGBase(abc.ABC):
             ("g(0) = +1",                   self.g(0.0),                      +1.0,      "eq"),
             ("dfdv(0) = s0",                self.dfdv(0.0),                   self.s0,   "eq"),
             ("dgdv(0) = -s0",               self.dgdv(0.0),                  -self.s0,   "eq"),
-            ("f(v_max) = y_NP",             self.f(self.v_max),               self.y_NP, "eq"),
-            ("g(v_max) = y_NP",             self.g(self.v_max),               self.y_NP, "eq"),
+            ("f(v_max) = f_target",         self.f(self.v_max),          self.f_target, "eq"),
+            ("g(v_max) = g_target",         self.g(self.v_max),          self.g_target, "eq"),
+            ("last ring radius = R",        (g_v[-1] - f_v[-1])/2.0,  self.ring_radius, "eq"),
             ("C1 at equator: f'+g' = 0",    self.dfdv(0.0) + self.dgdv(0.0),   0.0,      "eq"),
-            ("(c) pole closes: f-g = 0",    f_v[-1] - g_v[-1],                 0.0,      "eq"),
             ("pole latitude [deg]",         pole_lat,
              np.rad2deg(self.displaced_north_pole_lat),                                  "eq_loose"),
             ("(b) f strictly increasing",   dfdv_v.min(),                      0.0,      "gt"),
@@ -535,6 +554,590 @@ class FGLogCosh(FGBase):
 
     Three on g (2 unknowns B1, W_g after g(0) is hardcoded), four on f
     (3 unknowns A1, W_polar_f, W_tropics_f after f(0) is hardcoded).
+
+    # The functions f and g, and how to solve them
+
+    The function f is found by first defining its derivative, df/dv, with respect to pseudo
+    latitude because the resolution of grid along the y-axis, degrees per grid, corresponds
+    to scale factor along the y-axis. 
+
+    In Madec and Imbard (1996) they use hyperbolic tangent to construct the resolution dg/dj.
+    It is useful, but I alternate the way to prettify the math. First of all, dg/dj depends on
+    the grid resolution, and g' = g'(j) is difficult when designing the function. Therefore,
+    I enforce every expression to be in pseudo-latitude v. The only exception is that users
+    provide resolution dlat/dj because that is intuitive. The dlat/dj will translate into dg/dv
+    through the chain rule, as will be explained in later sections.
+
+    The df/dv and dg/dv are designed as a sum of pleateau-shaped functions beta. 
+
+        df/dv(v)   = A1 - W^f_trop * dbeta^f_trop/dv + W^f_polar * dbeta^f_polar/dv
+        dg/dv(v<0) = -df/dv
+        dg/dv(v>0) = -B1 - W^g_polar * dbeta^g_polar/dv
+
+    where A1 and B1 are the base resolution, W is the amplitude of the resolution transition,
+    with supscript being the function it belongs to and subscript being the location the transition
+    happens. Because f' > 0 and g' < 0 are two necessary conditions, the signs are chosen so that
+    we should expect W terms to be positive to be physically interpretable. The function dbeta/dv
+    is made of two hyperbolic tangents,
+
+        dbeta/dv(v) = c ( tanh((v+v_tran)/Delta_v) + tanh((v-v_tran)/Delta_v) )
+
+    where v_tran is the transition latitude, Delta_v the transition width, and c the normalization
+    constant such that dbeta/dv(v=0) = 1.
+
+    The f and g follows
+
+        f(v)   = A0 + A1 v - W^f_trop * beta^f_trop + W^f_polar * beta^f_polar
+        g(v<0) = -f
+        g(v>0) = B0 - B1 v - W^g_polar * beta^g_polar
+
+    Because Claude points out that the paper's boundary conditions do not seem to satisfy the 
+    condition that f(v=90deg) = g(v=90deg), I decide to do it in my way. So, the system I am 
+    solving is
+
+        Unknowns: A0, A1, B0, B1, W^f_trop, W^f_polar, and W^g_polar.
+        Boundary conditions:
+            
+            (1) f(0) = -1         => A0 = -1
+            (2) g(0) =  1         => B0 =  1
+            (3) df/dv(v_trop) =   s_trop
+            (4) dg/dv(v_trop) = - s_trop
+            (5) f(90deg) = y_np
+            (6) g(90deg) = y_np
+            (7) f'(v_polar) = s_polar
+
+    where s_0 and s_g is the resolution at the equator and the maximum latitude of the grid,
+    and y_np being the y location of the displaced north pole.
+
+    # How to see df/dv and dg/dv encompass grid resolution
+
+    The scale factor along the meridional direction is
+
+        e_2 = a sqrt( (dlon/dj * cos(lat))^2 + (dlat/dj)^2 )
+
+    where j is the grid index. Evaluate the trajectory tracking the y-axis intercept
+    (x, y) = (0, g(u)) gives
+
+        e_2 = a dlat/dj
+            = a d/dj (pi/2 - 2 arctan(|g|) )
+            = -2 a sgn(g) / (1 + g^2) * (dg/dv) (dv/dj) 
+    
+    Rearranging the above gives
+
+        dg/dv = -1/2 (dlat/dj) sgn(g) (1+g^2) / (dv/dj)
+
+    and similarly for f
+        
+        df/dv = -1/2 (dlat/dj) sgn(f) (1+f^2) / (dv/dj)
+
+    This is a pratical expression because user can specify the grid resolution dlat/dj
+    and obtain df/dv for a particular location.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 dlat_dv_polar,                 # [rad lat / rad v] at v_polar
+                 v_polar,                       # [rad] where dlat_dv_polar applies
+                 v_trans_tropics_f,             # [rad]
+                 v_trans_width_tropics_f,       # [rad]
+                 v_trans_polar_f,               # [rad]
+                 v_trans_width_polar_f,         # [rad]
+                 v_trans_g,                     # [rad]
+                 v_trans_g_width,               # [rad]
+                 ring_radius=0.0):              # [dimensionless] last-ring radius
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, ring_radius)
+        self.dlat_dv_polar = dlat_dv_polar
+        self.v_polar = v_polar
+        self.v_trans_tropics_f = v_trans_tropics_f
+        self.v_trans_width_tropics_f = v_trans_width_tropics_f
+        self.v_trans_polar_f = v_trans_polar_f
+        self.v_trans_width_polar_f = v_trans_width_polar_f
+        self.v_trans_g = v_trans_g
+        self.v_trans_g_width = v_trans_g_width
+
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    def f(self, v):
+        return -1.0 + self.A1 * v + (
+            - self.W_tropics_f * beta(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+            + self.W_polar_f * beta(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
+        )
+
+    def dfdv(self, v):
+        return self.A1 + (
+            - self.W_tropics_f * dbeta_dv(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
+            + self.W_polar_f * dbeta_dv(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
+        )
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        else:
+            return 1.0 - self.B1 * v - (
+                self.W_g * beta(v, self.v_trans_g, self.v_trans_g_width)
+            )
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        else:
+            return - self.B1 - (
+                self.W_g * dbeta_dv(v, self.v_trans_g, self.v_trans_g_width)
+            )
+
+    def transition_marks(self):
+        return [
+            (self.v_trans_tropics_f, "v_trans_tropics_f"),
+            (self.v_trans_polar_f,   "v_trans_polar_f"),
+            (self.v_trans_g,         "v_trans_g"),
+            (self.v_polar,           "v_polar"),
+        ]
+
+    c_f_const = -1.0   # f(0), hardcoded in f()
+    c_g_const = +1.0   # g(0), hardcoded in g()
+
+    def _solve(self):
+        v_star = -np.abs(self.v_polar)
+        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
+
+        s0     = self.s0
+        s_star = self.dlat_dv_to_dwdv(self.dlat_dv_polar, y_star)
+        self._s_star = s_star
+        self._v_star = v_star
+
+        # g: 2 unknowns from dgdv(0) = -s0 and g(v_max) = y_NP
+        self.B1, self.W_g = np.linalg.solve(
+            np.array([
+                [1,          dbeta_dv(0.0, self.v_trans_g, self.v_trans_g_width)],
+                [self.v_max, beta(self.v_max, self.v_trans_g, self.v_trans_g_width)],
+            ]),
+            np.array([s0, self.c_g_const - self.g_target]),
+        )
+
+        # f: 3 unknowns from dfdv(0) = s0, dfdv(v_star) = s_star, f(v_max) = y_NP.
+        # The third is a VALUE condition, so its amplitude entries are beta, not
+        # dbeta_dv -- the single easiest thing to get wrong here.
+        tt, wt = self.v_trans_tropics_f, self.v_trans_width_tropics_f
+        tp, wp = self.v_trans_polar_f,   self.v_trans_width_polar_f
+        self.A1, self.W_polar_f, self.W_tropics_f = np.linalg.solve(
+            np.array([
+                [1,          dbeta_dv(0.0,       tp, wp), -dbeta_dv(0.0,       tt, wt)],
+                [1,          dbeta_dv(v_star,    tp, wp), -dbeta_dv(v_star,    tt, wt)],
+                [self.v_max, beta(self.v_max,    tp, wp), -beta(self.v_max,    tt, wt)],
+            ]),
+            np.array([s0, s_star, self.f_target - self.c_f_const]),
+        )
+
+    def _scheme_checks(self):
+        return [
+            ("dfdv(v_polar) = s_polar", self.dfdv(self._v_star), self._s_star, "eq"),
+            ("design: W_polar_f   > 0", self.W_polar_f,          0.0,          "gt"),
+            ("design: W_tropics_f > 0", self.W_tropics_f,        0.0,          "gt"),
+            ("design: W_g         > 0", self.W_g,                0.0,          "gt"),
+        ]
+
+
+class FGCubic(FGBase):
+    """
+    Cubic Hermite formulation: f and g are the unique cubics matching a value
+    and a slope at each end of [0, v_max].
+
+        f(v) = c0 + c1 v + c2 v^2 + c3 v^3
+
+    Four coefficients, four conditions, and the interpolant is available in
+    closed form, so this scheme has no solver at all -- `_solve` is a few lines
+    of arithmetic rather than two linear systems. There are also no transition
+    parameters to choose.
+
+    Boundary conditions
+    -------------------
+        f(0) = -1,  dfdv(0) = +s0        g(0) = +1,  dgdv(0) = -s0
+        f(v_max) = y_NP,  dfdv(v_max)    g(v_max) = y_NP,  dgdv(v_max)
+
+    Two properties this buys over a scheme with mismatched bases:
+
+    - g gets a fourth condition, so its polar slope is specifiable. In the
+      log-cosh scheme g has only three parameters and dgdv(v_max) is whatever
+      falls out.
+    - because f and g are drawn from the SAME basis, mirrored boundary data
+      give exactly mirrored polynomials. Setting the mesh pole to 90 N with
+      mirrored polar slopes therefore yields g = -f identically, i.e. concentric
+      circles and a plain lat-lon grid, to the last bit.
+
+    What it gives up is local control. The log-cosh ramps let the paper place a
+    knee at a chosen latitude; a cubic is pinned only at its ends, and whatever
+    happens in between is forced by the endpoint data. Note that the mid-range
+    excursion is largely geometry rather than basis: f must cover the whole
+    continued-latitude span between its endpoints, so if both ends are held
+    below the mean rate the middle has to exceed it.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 dlat_dv_polar_f,               # [rad lat / rad v] at v_max, f branch
+                 dlat_dv_polar_g,               # [rad lat / rad v] at v_max, g branch
+                 ring_radius=0.0):              # [dimensionless] last-ring radius
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, ring_radius)
+        self.dlat_dv_polar_f = dlat_dv_polar_f
+        self.dlat_dv_polar_g = dlat_dv_polar_g
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    @staticmethod
+    def _hermite(y0, m0, y1, m1, L):
+        """Cubic Hermite on [0, L] in monomial form, c0 + c1 v + c2 v^2 + c3 v^3."""
+        D = (y1 - y0) / L
+        return np.array([y0, m0, (3*D - 2*m0 - m1)/L, (m0 + m1 - 2*D)/L**2])
+
+    def _solve(self):
+        # The f endpoint sits at y_NP > 0, i.e. PAST the zero crossing where the
+        # -y crossing has gone over the geographic pole. The folded-latitude
+        # Jacobian flips sign there, so use the continued-latitude form.
+        m1_f = self.dlat_dv_to_dfdv(self.dlat_dv_polar_f, self.f_target)
+        m1_g = self.dlat_dv_to_dgdv(self.dlat_dv_polar_g, self.g_target)
+
+        self.cf = self._hermite(-1.0,  self.s0, self.f_target, m1_f, self.v_max)
+        self.cg = self._hermite(+1.0, -self.s0, self.g_target, m1_g, self.v_max)
+
+    @staticmethod
+    def _poly(c, v):
+        return c[0] + c[1]*v + c[2]*v**2 + c[3]*v**3
+
+    @staticmethod
+    def _dpoly(c, v):
+        return c[1] + 2*c[2]*v + 3*c[3]*v**2
+
+    def f(self, v):
+        return self._poly(self.cf, v)
+
+    def dfdv(self, v):
+        return self._dpoly(self.cf, v)
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        return self._poly(self.cg, v)
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        return self._dpoly(self.cg, v)
+
+    @staticmethod
+    def _monotone_margin(alpha, beta):
+        """
+        Exact monotonicity test for a cubic Hermite (Fritsch and Carlson, 1980),
+        in terms of the endpoint slopes scaled by the secant, alpha = m0/D and
+        beta = m1/D. Returns a value that is positive exactly when the
+        interpolant is monotone.
+
+        The familiar alpha^2 + beta^2 <= 9 disk is only a SUFFICIENT condition --
+        an inscribed approximation of the true region -- so testing against it
+        reports failures for interpolants that are perfectly monotone. The full
+        region is the union of three half-planes and one curved piece.
+        """
+        if alpha < 0.0 or beta < 0.0:
+            return min(alpha, beta)
+        if (alpha + beta - 2.0 <= 0.0
+                or alpha + 2.0*beta - 3.0 <= 0.0
+                or 2.0*alpha + beta - 3.0 <= 0.0):
+            return 1.0                      # inside the half-plane part; any +ve means monotone
+        return alpha - (2.0*alpha + beta - 3.0)**2 / (3.0*(alpha + beta - 2.0))
+
+    def _scheme_checks(self):
+        """
+        Monotonicity established a priori from the endpoint data, rather than by
+        sampling as the base class does. For a cubic this is exact and costs
+        nothing, which is one of the quieter advantages of a closed-form scheme.
+        """
+        rows = []
+        for name, c, y0, y1 in [("f", self.cf, -1.0, self.f_target),
+                                ("g", self.cg, +1.0, self.g_target)]:
+            D = (y1 - y0) / self.v_max
+            a = self._dpoly(c, 0.0) / D
+            b = self._dpoly(c, self.v_max) / D
+            rows.append((f"{name}: monotone a priori", self._monotone_margin(a, b), 0.0, "gt"))
+        return rows
+
+
+class FGPolynomialStep(FGBase):
+    """
+    Smoothstep formulation: the RATE is a cubic step between two levels.
+
+        gamma(t) = 1 - 3 t^2 + 2 t^3          gamma(0)=1, gamma(1)=0
+        f'(v)    = B + A gamma(v / w)
+        f (v)    = c + B v + A w Gamma(v / w),   Gamma(t) = t - t^3 + t^4/2
+
+    Three unknowns per branch and three conditions, so the solve is a 2x2 after
+    the constant falls out. `w` is a hand-chosen shape parameter, not solved.
+
+    Why w >= V_MAX matters
+    ----------------------
+    gamma is monotone decreasing only on [0, 1]; past t = 1 its derivative
+    6t(t-1) turns positive and it grows again. Requiring w >= V_MAX keeps the
+    argument inside [0, 1], and then f' is monotone in v and therefore trapped
+    between its own endpoint values. Monotonicity of f collapses to a single
+    scalar test that can be made before evaluating anything:
+
+        f'(0) = s0 > 0 by construction, so  f increasing  <=>  f'(v_max) > 0
+
+    The determinant of the 2x2 is w Gamma(T) - v_max = -v_max T^2 (1 - T/2)
+    with T = v_max/w, strictly negative for T in (0, 1]. It vanishes only as
+    w -> infinity, where gamma is flat and f' cannot bend enough to reach y_NP.
+
+    Boundary conditions
+    -------------------
+        f(0) = -1,  f'(0) = +s0,  f(v_max) = y_NP
+        g(0) = +1,  g'(0) = -s0,  g(v_max) = y_NP
+
+    The polar rates f'(v_max) and g'(v_max) are OUTCOMES, not inputs. That is
+    the price of the simple solve and the cheap guarantee.
+
+    The g branch is the binding one
+    ------------------------------
+    f travels y_NP + 1 while g travels only y_NP - 1 -- 2.75x less at a 40 N
+    mesh pole -- yet C1 across the equator forces both to start at |slope| = s0.
+    So g must shed much more slope over the same v range, and it is g, not f,
+    that turns around first. At w = V_MAX the condition is exactly
+
+        s0 < 2 (1 - y_NP) / v_max
+
+    which is 0.68 for a pole at 40 N and only 0.38 at 20 N. In grid terms s0 is
+    the equatorial spacing divided by dv/dj, so this says the equator must be
+    meaningfully finer than uniform -- ordinary tropical refinement, but it is a
+    real constraint and `_scheme_checks` guards both branches.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 v_width_f,                     # [rad] must be >= V_MAX
+                 v_width_g=None,                # [rad] defaults to v_width_f
+                 ring_radius=0.0):              # [dimensionless] last-ring radius
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, ring_radius)
+        self.v_width_f = v_width_f
+        self.v_width_g = v_width_f if v_width_g is None else v_width_g
+        for name, w in (("v_width_f", self.v_width_f), ("v_width_g", self.v_width_g)):
+            if w < self.v_max:
+                raise ValueError(
+                    f"{name} = {np.rad2deg(w):.2f} deg is below V_MAX = "
+                    f"{np.rad2deg(self.v_max):.2f} deg. gamma is only monotone on "
+                    f"[0, 1], so a narrower width lets the rate turn around inside "
+                    f"the domain and the monotonicity guarantee is lost.")
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    @staticmethod
+    def _gamma(t):
+        return 1.0 - 3.0*t**2 + 2.0*t**3
+
+    @staticmethod
+    def _Gamma(t):
+        """Antiderivative of _gamma vanishing at 0."""
+        return t - t**3 + 0.5*t**4
+
+    def _branch(self, slope_at_0, total_rise, w):
+        """(B, A) from  B + A = slope_at_0  and  B v_max + A w Gamma(T) = total_rise."""
+        T = self.v_max / w
+        return np.linalg.solve(
+            np.array([[1.0,        1.0],
+                      [self.v_max, w*self._Gamma(T)]]),
+            np.array([slope_at_0, total_rise]))
+
+    def _solve(self):
+        self.c_f = -1.0
+        self.c_g = +1.0
+        self.B_f, self.A_f = self._branch(+self.s0, self.f_target - self.c_f, self.v_width_f)
+        self.B_g, self.A_g = self._branch(-self.s0, self.g_target - self.c_g, self.v_width_g)
+
+    def f(self, v):
+        w = self.v_width_f
+        return self.c_f + self.B_f*v + self.A_f*w*self._Gamma(v/w)
+
+    def dfdv(self, v):
+        return self.B_f + self.A_f*self._gamma(v/self.v_width_f)
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        w = self.v_width_g
+        return self.c_g + self.B_g*v + self.A_g*w*self._Gamma(v/w)
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        return self.B_g + self.A_g*self._gamma(v/self.v_width_g)
+
+    def max_dlat_dv_equator(self):
+        """
+        Largest s0 for which BOTH branches stay monotone, found from the closed
+        form of the endpoint rates. Useful for reporting why a configuration was
+        rejected, since g binds well before f does.
+        """
+        out = []
+        for sign, c, w, tgt in ((+1.0, self.c_f, self.v_width_f, self.f_target),
+                                (-1.0, self.c_g, self.v_width_g, self.g_target)):
+            T = self.v_max / w
+            # endpoint rate is affine in s0; solve  rate(s0) = 0  from two samples
+            r = []
+            for s in (1.0, 2.0):
+                B, A = self._branch(sign*s, tgt - c, w)
+                r.append(sign*(B + A*self._gamma(T)))
+            out.append(1.0 + (2.0 - 1.0)*(0.0 - r[0])/(r[1] - r[0]))
+        return min(out)
+
+    def transition_marks(self):
+        marks = [(self.v_width_f, "v_width_f")]
+        if self.v_width_g != self.v_width_f:
+            marks.append((self.v_width_g, "v_width_g"))
+        return marks
+
+    def _scheme_checks(self):
+        """
+        Both endpoint rates, which is the whole of the monotonicity question for
+        this scheme: gamma keeps f' and g' trapped between their endpoints, so
+        signs at the two ends are necessary and sufficient.
+        """
+        Tf = self.v_max / self.v_width_f
+        Tg = self.v_max / self.v_width_g
+        return [
+            ("f'(v_max) > 0 (outcome)", self.B_f + self.A_f*self._gamma(Tf), 0.0, "gt"),
+            ("g'(v_max) < 0 (outcome)", self.B_g + self.A_g*self._gamma(Tg), 0.0, "lt"),
+        ]
+
+
+class FGLinear(FGBase):
+    """
+    The simplest formulation that still carries a monotonicity guarantee: the
+    RATE is linear in v, so f and g are quadratics.
+
+        f'(v) = a + b v          f(v) = c0 + a v + (b/2) v^2
+
+    "Linear" refers to the derivative, not to f itself.
+
+    Three unknowns per branch and three conditions, and they unwind one at a
+    time -- there is no linear system to assemble at all:
+
+        f(0)      = -1     ->  c0 = -1
+        f'(0)     = s0     ->  a  = s0
+        f(v_max)  = y_NP   ->  b  = 2 (y_NP + 1 - s0 v_max) / v_max^2
+
+    and the polar rate follows as an outcome,
+
+        f'(v_max) = 2 (y_NP + 1)/v_max - s0 = 2 <f'> - s0
+
+    Monotonicity
+    ------------
+    A linear f' is monotone in v, so it is trapped between its endpoint values.
+    Hence f is strictly increasing exactly when s0 > 0 and f'(v_max) > 0, both
+    known in closed form before anything is evaluated. Same guarantee as
+    FGPolynomialStep, obtained the same way, with less machinery.
+
+    Relation to FGPolynomialStep
+    ---------------------------
+    The two schemes share their endpoint algebra exactly, including the binding
+    constraint on the g branch,
+
+        s0 < 2 (1 - y_NP) / v_max
+
+    because both satisfy <f'> = (f'(0) + f'(v_max))/2 -- trivially for a
+    straight line, and for gamma because it integrates to 1/2 over [0, 1]. The
+    geometry fixes <f'> = (y_NP + 1)/v_max, so both end up with the same
+    relation between s0 and the polar rate.
+
+    What FGPolynomialStep buys over this is therefore only the SHAPE between the
+    endpoints: gamma is flat at both ends (f'' = 0 there) and concentrates the
+    change in the middle, whereas here the rate changes at a constant pace
+    throughout. That matters mainly at the equator, where the northern branch
+    meets a uniform southern lat-lon patch and a settled rate makes the join
+    smoother than C1.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 ring_radius=0.0):              # [dimensionless] last-ring radius
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, ring_radius)
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    def _solve(self):
+        V = self.v_max
+        self.c0_f, self.a_f = -1.0, +self.s0
+        self.c0_g, self.a_g = +1.0, -self.s0
+        self.b_f = 2.0*(self.f_target - self.c0_f - self.a_f*V) / V**2
+        self.b_g = 2.0*(self.g_target - self.c0_g - self.a_g*V) / V**2
+
+    def f(self, v):
+        return self.c0_f + self.a_f*v + 0.5*self.b_f*v**2
+
+    def dfdv(self, v):
+        return self.a_f + self.b_f*v
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        return self.c0_g + self.a_g*v + 0.5*self.b_g*v**2
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        return self.a_g + self.b_g*v
+
+    def max_dlat_dv_equator(self):
+        """
+        Largest s0 keeping both branches monotone. f needs f'(v_max) > 0 and g
+        needs g'(v_max) < 0; substituting the closed forms gives
+        2(1 + y_NP)/v_max and 2(1 - y_NP)/v_max respectively, and since y_NP > 0
+        for a mesh pole in the northern hemisphere it is always g that binds.
+        """
+        V = self.v_max
+        return min(2.0*(1.0 + self.f_target)/V, 2.0*(1.0 - self.g_target)/V)
+
+    def _scheme_checks(self):
+        """
+        The two endpoint rates are the whole monotonicity question here, since a
+        linear f' cannot leave the interval spanned by its ends.
+        """
+        return [
+            ("f'(v_max) > 0 (outcome)", self.dfdv(self.v_max), 0.0, "gt"),
+            ("g'(v_max) < 0 (outcome)", self.dgdv(self.v_max), 0.0, "lt"),
+        ]
+
+class FGTanh(FGBase):
+    """
+    An adaptation of Madec and Imbard (1996), first define f' and g' as
+
+        f'(v) =   C1_f - W_f * tanh( (v - v_c) / delta_v_f)
+        g'(v) = - C1_g + W_g * tanh( (v - v_c) / delta_g_f)
+
+    After integration, we find
+
+        f(v) = C0_f + C1_f v - (A_f/delta_v_f) * tanh( (v - v_c_f) / delta_v_f)
+        g(v) = C0_g - C1_g v + (A_g/delta_v_g) * tanh( (v - v_c_g) / delta_v_g)
+
+    Boundary conditions
+    -------------------
+        f(0) = -1                    g(0) = +1
+        dfdv(0) = s0                 dgdv(0) = -s0        (C1 across the equator)
+        dfdv(v_polar) = s_polar_f    dgdv(v_polar) = s_polar_g
+        f(v_max) = y_NP              g(v_max) = y_NP
+
+    Since delta_v are given, f comes with four unknowns: C0_f, C1_f, A_f, and v_c_f.
+    g also comes with four unknowns: C0_g, C1_g, A_g, and v_c_g.
+
+    
 
     # The functions f and g, and how to solve them
 
@@ -718,376 +1321,6 @@ class FGLogCosh(FGBase):
         ]
 
 
-class FGCubic(FGBase):
-    """
-    Cubic Hermite formulation: f and g are the unique cubics matching a value
-    and a slope at each end of [0, v_max].
-
-        f(v) = c0 + c1 v + c2 v^2 + c3 v^3
-
-    Four coefficients, four conditions, and the interpolant is available in
-    closed form, so this scheme has no solver at all -- `_solve` is a few lines
-    of arithmetic rather than two linear systems. There are also no transition
-    parameters to choose.
-
-    Boundary conditions
-    -------------------
-        f(0) = -1,  dfdv(0) = +s0        g(0) = +1,  dgdv(0) = -s0
-        f(v_max) = y_NP,  dfdv(v_max)    g(v_max) = y_NP,  dgdv(v_max)
-
-    Two properties this buys over a scheme with mismatched bases:
-
-    - g gets a fourth condition, so its polar slope is specifiable. In the
-      log-cosh scheme g has only three parameters and dgdv(v_max) is whatever
-      falls out.
-    - because f and g are drawn from the SAME basis, mirrored boundary data
-      give exactly mirrored polynomials. Setting the mesh pole to 90 N with
-      mirrored polar slopes therefore yields g = -f identically, i.e. concentric
-      circles and a plain lat-lon grid, to the last bit.
-
-    What it gives up is local control. The log-cosh ramps let the paper place a
-    knee at a chosen latitude; a cubic is pinned only at its ends, and whatever
-    happens in between is forced by the endpoint data. Note that the mid-range
-    excursion is largely geometry rather than basis: f must cover the whole
-    continued-latitude span between its endpoints, so if both ends are held
-    below the mean rate the middle has to exceed it.
-    """
-
-    def __init__(self,
-                 displaced_north_pole_lat,      # [rad]
-                 dlat_dv_equator,               # [rad lat / rad v]
-                 dlat_dv_polar_f,               # [rad lat / rad v] at v_max, f branch
-                 dlat_dv_polar_g):              # [rad lat / rad v] at v_max, g branch
-        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
-        self.dlat_dv_polar_f = dlat_dv_polar_f
-        self.dlat_dv_polar_g = dlat_dv_polar_g
-        self._solve()
-        if not self.verify(verbose=False):
-            print(f"{type(self).__name__}: verify() reported failures; "
-                  f"call verify() for the detail.")
-
-    @staticmethod
-    def _hermite(y0, m0, y1, m1, L):
-        """Cubic Hermite on [0, L] in monomial form, c0 + c1 v + c2 v^2 + c3 v^3."""
-        D = (y1 - y0) / L
-        return np.array([y0, m0, (3*D - 2*m0 - m1)/L, (m0 + m1 - 2*D)/L**2])
-
-    def _solve(self):
-        # The f endpoint sits at y_NP > 0, i.e. PAST the zero crossing where the
-        # -y crossing has gone over the geographic pole. The folded-latitude
-        # Jacobian flips sign there, so use the continued-latitude form.
-        m1_f = self.dlat_dv_to_dfdv(self.dlat_dv_polar_f, self.y_NP)
-        m1_g = self.dlat_dv_to_dgdv(self.dlat_dv_polar_g, self.y_NP)
-
-        self.cf = self._hermite(-1.0,  self.s0, self.y_NP, m1_f, self.v_max)
-        self.cg = self._hermite(+1.0, -self.s0, self.y_NP, m1_g, self.v_max)
-
-    @staticmethod
-    def _poly(c, v):
-        return c[0] + c[1]*v + c[2]*v**2 + c[3]*v**3
-
-    @staticmethod
-    def _dpoly(c, v):
-        return c[1] + 2*c[2]*v + 3*c[3]*v**2
-
-    def f(self, v):
-        return self._poly(self.cf, v)
-
-    def dfdv(self, v):
-        return self._dpoly(self.cf, v)
-
-    def g(self, v):
-        if v < 0:
-            return - self.f(v)
-        return self._poly(self.cg, v)
-
-    def dgdv(self, v):
-        if v < 0:
-            return - self.dfdv(v)
-        return self._dpoly(self.cg, v)
-
-    @staticmethod
-    def _monotone_margin(alpha, beta):
-        """
-        Exact monotonicity test for a cubic Hermite (Fritsch and Carlson, 1980),
-        in terms of the endpoint slopes scaled by the secant, alpha = m0/D and
-        beta = m1/D. Returns a value that is positive exactly when the
-        interpolant is monotone.
-
-        The familiar alpha^2 + beta^2 <= 9 disk is only a SUFFICIENT condition --
-        an inscribed approximation of the true region -- so testing against it
-        reports failures for interpolants that are perfectly monotone. The full
-        region is the union of three half-planes and one curved piece.
-        """
-        if alpha < 0.0 or beta < 0.0:
-            return min(alpha, beta)
-        if (alpha + beta - 2.0 <= 0.0
-                or alpha + 2.0*beta - 3.0 <= 0.0
-                or 2.0*alpha + beta - 3.0 <= 0.0):
-            return 1.0                      # inside the half-plane part; any +ve means monotone
-        return alpha - (2.0*alpha + beta - 3.0)**2 / (3.0*(alpha + beta - 2.0))
-
-    def _scheme_checks(self):
-        """
-        Monotonicity established a priori from the endpoint data, rather than by
-        sampling as the base class does. For a cubic this is exact and costs
-        nothing, which is one of the quieter advantages of a closed-form scheme.
-        """
-        rows = []
-        for name, c, y0, y1 in [("f", self.cf, -1.0, self.y_NP),
-                                ("g", self.cg, +1.0, self.y_NP)]:
-            D = (y1 - y0) / self.v_max
-            a = self._dpoly(c, 0.0) / D
-            b = self._dpoly(c, self.v_max) / D
-            rows.append((f"{name}: monotone a priori", self._monotone_margin(a, b), 0.0, "gt"))
-        return rows
-
-
-class FGPolynomialStep(FGBase):
-    """
-    Smoothstep formulation: the RATE is a cubic step between two levels.
-
-        gamma(t) = 1 - 3 t^2 + 2 t^3          gamma(0)=1, gamma(1)=0
-        f'(v)    = B + A gamma(v / w)
-        f (v)    = c + B v + A w Gamma(v / w),   Gamma(t) = t - t^3 + t^4/2
-
-    Three unknowns per branch and three conditions, so the solve is a 2x2 after
-    the constant falls out. `w` is a hand-chosen shape parameter, not solved.
-
-    Why w >= V_MAX matters
-    ----------------------
-    gamma is monotone decreasing only on [0, 1]; past t = 1 its derivative
-    6t(t-1) turns positive and it grows again. Requiring w >= V_MAX keeps the
-    argument inside [0, 1], and then f' is monotone in v and therefore trapped
-    between its own endpoint values. Monotonicity of f collapses to a single
-    scalar test that can be made before evaluating anything:
-
-        f'(0) = s0 > 0 by construction, so  f increasing  <=>  f'(v_max) > 0
-
-    The determinant of the 2x2 is w Gamma(T) - v_max = -v_max T^2 (1 - T/2)
-    with T = v_max/w, strictly negative for T in (0, 1]. It vanishes only as
-    w -> infinity, where gamma is flat and f' cannot bend enough to reach y_NP.
-
-    Boundary conditions
-    -------------------
-        f(0) = -1,  f'(0) = +s0,  f(v_max) = y_NP
-        g(0) = +1,  g'(0) = -s0,  g(v_max) = y_NP
-
-    The polar rates f'(v_max) and g'(v_max) are OUTCOMES, not inputs. That is
-    the price of the simple solve and the cheap guarantee.
-
-    The g branch is the binding one
-    ------------------------------
-    f travels y_NP + 1 while g travels only y_NP - 1 -- 2.75x less at a 40 N
-    mesh pole -- yet C1 across the equator forces both to start at |slope| = s0.
-    So g must shed much more slope over the same v range, and it is g, not f,
-    that turns around first. At w = V_MAX the condition is exactly
-
-        s0 < 2 (1 - y_NP) / v_max
-
-    which is 0.68 for a pole at 40 N and only 0.38 at 20 N. In grid terms s0 is
-    the equatorial spacing divided by dv/dj, so this says the equator must be
-    meaningfully finer than uniform -- ordinary tropical refinement, but it is a
-    real constraint and `_scheme_checks` guards both branches.
-    """
-
-    def __init__(self,
-                 displaced_north_pole_lat,      # [rad]
-                 dlat_dv_equator,               # [rad lat / rad v]
-                 v_width_f,                     # [rad] must be >= V_MAX
-                 v_width_g=None):               # [rad] defaults to v_width_f
-        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
-        self.v_width_f = v_width_f
-        self.v_width_g = v_width_f if v_width_g is None else v_width_g
-        for name, w in (("v_width_f", self.v_width_f), ("v_width_g", self.v_width_g)):
-            if w < self.v_max:
-                raise ValueError(
-                    f"{name} = {np.rad2deg(w):.2f} deg is below V_MAX = "
-                    f"{np.rad2deg(self.v_max):.2f} deg. gamma is only monotone on "
-                    f"[0, 1], so a narrower width lets the rate turn around inside "
-                    f"the domain and the monotonicity guarantee is lost.")
-        self._solve()
-        if not self.verify(verbose=False):
-            print(f"{type(self).__name__}: verify() reported failures; "
-                  f"call verify() for the detail.")
-
-    @staticmethod
-    def _gamma(t):
-        return 1.0 - 3.0*t**2 + 2.0*t**3
-
-    @staticmethod
-    def _Gamma(t):
-        """Antiderivative of _gamma vanishing at 0."""
-        return t - t**3 + 0.5*t**4
-
-    def _branch(self, slope_at_0, total_rise, w):
-        """(B, A) from  B + A = slope_at_0  and  B v_max + A w Gamma(T) = total_rise."""
-        T = self.v_max / w
-        return np.linalg.solve(
-            np.array([[1.0,        1.0],
-                      [self.v_max, w*self._Gamma(T)]]),
-            np.array([slope_at_0, total_rise]))
-
-    def _solve(self):
-        self.c_f = -1.0
-        self.c_g = +1.0
-        self.B_f, self.A_f = self._branch(+self.s0, self.y_NP - self.c_f, self.v_width_f)
-        self.B_g, self.A_g = self._branch(-self.s0, self.y_NP - self.c_g, self.v_width_g)
-
-    def f(self, v):
-        w = self.v_width_f
-        return self.c_f + self.B_f*v + self.A_f*w*self._Gamma(v/w)
-
-    def dfdv(self, v):
-        return self.B_f + self.A_f*self._gamma(v/self.v_width_f)
-
-    def g(self, v):
-        if v < 0:
-            return - self.f(v)
-        w = self.v_width_g
-        return self.c_g + self.B_g*v + self.A_g*w*self._Gamma(v/w)
-
-    def dgdv(self, v):
-        if v < 0:
-            return - self.dfdv(v)
-        return self.B_g + self.A_g*self._gamma(v/self.v_width_g)
-
-    def max_dlat_dv_equator(self):
-        """
-        Largest s0 for which BOTH branches stay monotone, found from the closed
-        form of the endpoint rates. Useful for reporting why a configuration was
-        rejected, since g binds well before f does.
-        """
-        out = []
-        for sign, c, w in ((+1.0, self.c_f, self.v_width_f),
-                           (-1.0, self.c_g, self.v_width_g)):
-            T = self.v_max / w
-            # endpoint rate is affine in s0; solve  rate(s0) = 0  from two samples
-            r = []
-            for s in (1.0, 2.0):
-                B, A = self._branch(sign*s, self.y_NP - c, w)
-                r.append(sign*(B + A*self._gamma(T)))
-            out.append(1.0 + (2.0 - 1.0)*(0.0 - r[0])/(r[1] - r[0]))
-        return min(out)
-
-    def transition_marks(self):
-        marks = [(self.v_width_f, "v_width_f")]
-        if self.v_width_g != self.v_width_f:
-            marks.append((self.v_width_g, "v_width_g"))
-        return marks
-
-    def _scheme_checks(self):
-        """
-        Both endpoint rates, which is the whole of the monotonicity question for
-        this scheme: gamma keeps f' and g' trapped between their endpoints, so
-        signs at the two ends are necessary and sufficient.
-        """
-        Tf = self.v_max / self.v_width_f
-        Tg = self.v_max / self.v_width_g
-        return [
-            ("f'(v_max) > 0 (outcome)", self.B_f + self.A_f*self._gamma(Tf), 0.0, "gt"),
-            ("g'(v_max) < 0 (outcome)", self.B_g + self.A_g*self._gamma(Tg), 0.0, "lt"),
-        ]
-
-
-class FGLinear(FGBase):
-    """
-    The simplest formulation that still carries a monotonicity guarantee: the
-    RATE is linear in v, so f and g are quadratics.
-
-        f'(v) = a + b v          f(v) = c0 + a v + (b/2) v^2
-
-    "Linear" refers to the derivative, not to f itself.
-
-    Three unknowns per branch and three conditions, and they unwind one at a
-    time -- there is no linear system to assemble at all:
-
-        f(0)      = -1     ->  c0 = -1
-        f'(0)     = s0     ->  a  = s0
-        f(v_max)  = y_NP   ->  b  = 2 (y_NP + 1 - s0 v_max) / v_max^2
-
-    and the polar rate follows as an outcome,
-
-        f'(v_max) = 2 (y_NP + 1)/v_max - s0 = 2 <f'> - s0
-
-    Monotonicity
-    ------------
-    A linear f' is monotone in v, so it is trapped between its endpoint values.
-    Hence f is strictly increasing exactly when s0 > 0 and f'(v_max) > 0, both
-    known in closed form before anything is evaluated. Same guarantee as
-    FGPolynomialStep, obtained the same way, with less machinery.
-
-    Relation to FGPolynomialStep
-    ---------------------------
-    The two schemes share their endpoint algebra exactly, including the binding
-    constraint on the g branch,
-
-        s0 < 2 (1 - y_NP) / v_max
-
-    because both satisfy <f'> = (f'(0) + f'(v_max))/2 -- trivially for a
-    straight line, and for gamma because it integrates to 1/2 over [0, 1]. The
-    geometry fixes <f'> = (y_NP + 1)/v_max, so both end up with the same
-    relation between s0 and the polar rate.
-
-    What FGPolynomialStep buys over this is therefore only the SHAPE between the
-    endpoints: gamma is flat at both ends (f'' = 0 there) and concentrates the
-    change in the middle, whereas here the rate changes at a constant pace
-    throughout. That matters mainly at the equator, where the northern branch
-    meets a uniform southern lat-lon patch and a settled rate makes the join
-    smoother than C1.
-    """
-
-    def __init__(self,
-                 displaced_north_pole_lat,      # [rad]
-                 dlat_dv_equator):              # [rad lat / rad v]
-        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
-        self._solve()
-        if not self.verify(verbose=False):
-            print(f"{type(self).__name__}: verify() reported failures; "
-                  f"call verify() for the detail.")
-
-    def _solve(self):
-        V = self.v_max
-        self.c0_f, self.a_f = -1.0, +self.s0
-        self.c0_g, self.a_g = +1.0, -self.s0
-        self.b_f = 2.0*(self.y_NP - self.c0_f - self.a_f*V) / V**2
-        self.b_g = 2.0*(self.y_NP - self.c0_g - self.a_g*V) / V**2
-
-    def f(self, v):
-        return self.c0_f + self.a_f*v + 0.5*self.b_f*v**2
-
-    def dfdv(self, v):
-        return self.a_f + self.b_f*v
-
-    def g(self, v):
-        if v < 0:
-            return - self.f(v)
-        return self.c0_g + self.a_g*v + 0.5*self.b_g*v**2
-
-    def dgdv(self, v):
-        if v < 0:
-            return - self.dfdv(v)
-        return self.a_g + self.b_g*v
-
-    def max_dlat_dv_equator(self):
-        """
-        Largest s0 keeping both branches monotone. f needs f'(v_max) > 0 and g
-        needs g'(v_max) < 0; substituting the closed forms gives
-        2(1 + y_NP)/v_max and 2(1 - y_NP)/v_max respectively, and since y_NP > 0
-        for a mesh pole in the northern hemisphere it is always g that binds.
-        """
-        V = self.v_max
-        return min(2.0*(1.0 + self.y_NP)/V, 2.0*(1.0 - self.y_NP)/V)
-
-    def _scheme_checks(self):
-        """
-        The two endpoint rates are the whole monotonicity question here, since a
-        linear f' cannot leave the interval spanned by its ends.
-        """
-        return [
-            ("f'(v_max) > 0 (outcome)", self.dfdv(self.v_max), 0.0, "gt"),
-            ("g'(v_max) < 0 (outcome)", self.dgdv(self.v_max), 0.0, "lt"),
-        ]
 
 
 class DisplacedPoleGrid:
@@ -1829,12 +2062,12 @@ if __name__ == "__main__":
     #test_plot_fg_derivatives(output_file="figure_fg_derivative_cubic.png",
     #                         formulation="cubic")
     test_plot_fg_derivatives(output_file="figure_fg_derivative_polystep.png",
-                             formulation="polystep", dlat_in_SH_degree=3)
+                             formulation="linear", dlat_in_SH_degree=3)
 
 
     print("Plotting grid...")
     test_plot_grid_naive(
-        formulation="polystep",
+        formulation="linear",
         dlat_in_SH_degree=3
     )
     #test_plot_grid()
