@@ -1579,45 +1579,78 @@ def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None
         print("Wrote plot: ", output_file)
 
 
-def test_plot_fg_derivatives(output_file: str = None):
+def test_plot_fg_derivatives(output_file: str = None,
+                             formulation: str = "logcosh",
+                             v_min_degree: float = 0.0,
+                             **grid_kwargs):
     """
-    Plot df/dv and dg/dv against v, the analogue of Fig. 2 of Madec and Imbard
-    (1996), where the envelope of the e2 curves is exactly these derivatives.
+    Three panels for a formulation, reading top-down as value, rate, and
+    physical consequence:
 
-    Two panels, because the two quantities answer different questions:
+    - top: f and g themselves. Monotonicity is directly visible here rather than
+      inferred, and the vertical gap between the curves is twice the J-curve
+      radius, so property (a) -- strictly embedded circles -- is the statement
+      that the two curves never touch before the mesh pole.
+    - middle: df/dv and dg/dv, signed. These are what the boundary conditions
+      pin, so they are readable straight off the axes. Zero crossings are marked
+      because that is exactly where a branch reverses.
+    - bottom: the same information as meridional grid spacing in degrees per row,
+      dlat/dj = |d/dv| * 2/(1 + w^2) * dv/dj. The Jacobian is far from 1 away
+      from the equator, so this does not have the shape of the middle panel, and
+      it is the one to judge resolution by.
 
-    - top: the raw shape derivatives. These are what the formulation's boundary
-      conditions pin, so they are directly readable off the axes.
-    - bottom: the same information converted to meridional grid spacing in
-      degrees per row, via dlat/dj = |d/dv| * 2/(1 + w^2) * dv/dj. That factor
-      is not close to 1 away from the equator, so the two panels do not have
-      the same shape, and the bottom one is the one to judge resolution by.
+    Note the bottom panel is a MAGNITUDE. A branch reversing shows up there as a
+    touch-down to zero, which reads like very fine rows rather than a failure --
+    which is why the middle panel marks the crossings explicitly.
 
-    v < 0 is shaded: a formulation may still be defined there, and a boundary
-    condition may still act there, but the mesh does not use it -- the southern
-    hemisphere is the lat-lon patch.
+    v < 0 is shaded when plotted: a formulation may still be defined there, and
+    a boundary condition may still act there, but the mesh does not use it --
+    the southern hemisphere is the lat-lon patch.
 
-    Formulation-agnostic: it reads only grid.fg's four methods, s0, and
+    Formulation-agnostic: it reads only grid.fg's four methods, s0 and
     transition_marks(), so it works for any FGBase subclass.
     """
     import matplotlib.pyplot as plt
 
-    grid = build_example_grid()
+    grid = build_example_grid(formulation=formulation, **grid_kwargs)
     fg = grid.fg
     r2d = np.rad2deg
 
-    v = np.linspace(-V_MAX, V_MAX, 1201)
+    v = np.linspace(np.deg2rad(v_min_degree), V_MAX, 1201)
     dfdv = np.array([fg.dfdv(vv) for vv in v])
     dgdv = np.array([fg.dgdv(vv) for vv in v])
     f_v  = np.array([fg.f(vv) for vv in v])
     g_v  = np.array([fg.g(vv) for vv in v])
 
+    def zero_crossings(y):
+        idx = np.where(np.sign(y[:-1]) * np.sign(y[1:]) < 0)[0]
+        return [v[i] - y[i]*(v[i+1]-v[i])/(y[i+1]-y[i]) for i in idx]
+
+    crossings = [(vc, "f'") for vc in zero_crossings(dfdv)] + \
+                [(vc, "g'") for vc in zero_crossings(dgdv)]
+
     # ordinate rate -> meridional spacing in degrees per row
     to_deg_per_row = lambda d, w: r2d(np.abs(d) * 2.0/(1.0 + w**2) * grid.dvdj)
 
-    fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
 
     ax = axes[0]
+    ax.plot(r2d(v), f_v, label="f  (crossing on lon 270)", lw=1.6)
+    ax.plot(r2d(v), g_v, label="g  (crossing on lon 90)", lw=1.6)
+    ax.fill_between(r2d(v), f_v, g_v, color="0.85", zorder=0,
+                    label="J-curve diameter (g - f)")
+    ax.axhline(0.0, color="0.7", lw=0.8)
+    ax.plot([0, 0, r2d(V_MAX)], [-1.0, 1.0, fg.y_NP], "k.", ms=8, zorder=5)
+    ax.annotate(f"  f(0) = -1", (0, -1.0), fontsize=8, va="top")
+    ax.annotate(f"  g(0) = +1", (0, 1.0), fontsize=8, va="bottom")
+    ax.annotate(f"f = g = y_NP = {fg.y_NP:.4f}  ", (r2d(V_MAX), fg.y_NP),
+                fontsize=8, va="bottom", ha="right")
+    ax.set_ylabel("stereographic ordinate")
+    ax.set_title(f"{type(fg).__name__}: f and g "
+                 f"(monotonicity and embedding are visible here)")
+    ax.legend(loc="center left", fontsize=9)
+
+    ax = axes[1]
     ax.plot(r2d(v), dfdv, label="df/dv", lw=1.6)
     ax.plot(r2d(v), dgdv, label="dg/dv", lw=1.6)
     ax.axhline(0.0, color="0.7", lw=0.8)
@@ -1625,33 +1658,44 @@ def test_plot_fg_derivatives(output_file: str = None):
     ax.plot([0, 0], [s0, -s0], "k.", ms=8, zorder=5)
     ax.annotate(f"  f'(0) = +s0 = {s0:.4f}", (0, s0), fontsize=8, va="bottom")
     ax.annotate(f"  g'(0) = -s0", (0, -s0), fontsize=8, va="top")
+    for vc, which in crossings:
+        ax.plot(r2d(vc), 0.0, "rx", ms=9, mew=2, zorder=6)
+        ax.annotate(f" {which} = 0 at {r2d(vc):.1f} deg", (r2d(vc), 0.0),
+                    fontsize=8, color="red", va="bottom")
     ax.set_ylabel("d/dv  [stereographic radius per rad of v]")
     ax.set_title("Shape derivatives (what the boundary conditions pin)")
     ax.legend(loc="upper left", fontsize=9)
 
-    ax = axes[1]
+    ax = axes[2]
     ax.plot(r2d(v), to_deg_per_row(dfdv, f_v), label="f branch (lon 270 / 90)", lw=1.6)
     ax.plot(r2d(v), to_deg_per_row(dgdv, g_v), label="g branch (lon 90)", lw=1.6)
     ax.axhline(r2d(fg.s0 * grid.dvdj), color="0.5", ls=":", lw=1.0,
                label="equatorial resolution")
-    ax.set_ylabel("meridional spacing  [deg / row]")
+    ax.set_ylabel("meridional spacing  [deg / row]   (magnitude)")
     ax.set_xlabel("v  [deg]")
     ax.set_title("Same thing as grid resolution (paper Fig. 2)")
     ax.legend(loc="upper left", fontsize=9)
 
     for ax in axes:
-        ax.axvspan(r2d(v[0]), 0.0, color="0.9", zorder=0)
-        ax.annotate("not used by the mesh\n(lat-lon patch)", (r2d(v[0]) * 0.95, ax.get_ylim()[1]),
-                    fontsize=7, color="0.4", va="top")
+        if v[0] < 0.0:
+            ax.axvspan(r2d(v[0]), 0.0, color="0.9", zorder=0)
         for vt, name in fg.transition_marks():
-            ax.axvline(r2d(vt), color="0.3", ls="--", lw=0.7, alpha=0.5)
+            if v[0] <= vt <= v[-1] and abs(vt - V_MAX) > 1e-9:
+                ax.axvline(r2d(vt), color="0.3", ls="--", lw=0.7, alpha=0.5)
+        for vc, _ in crossings:
+            ax.axvline(r2d(vc), color="red", ls=":", lw=1.0, alpha=0.7)
         ax.axvline(90.0, color="k", lw=0.8, alpha=0.6)
         ax.grid(alpha=0.25)
 
+    if v[0] < 0.0:
+        axes[0].annotate("not used by the mesh\n(lat-lon patch)",
+                         (r2d(v[0]) * 0.95, axes[0].get_ylim()[1]),
+                         fontsize=7, color="0.4", va="top")
     for vt, name in fg.transition_marks():
-        axes[0].annotate(name, (r2d(vt), axes[0].get_ylim()[0]), fontsize=6,
-                         rotation=90, va="bottom", ha="right", color="0.3")
-    axes[0].annotate("mesh pole", (90.0, axes[0].get_ylim()[0]), fontsize=7,
+        if v[0] <= vt <= v[-1] and abs(vt - V_MAX) > 1e-9:
+            axes[1].annotate(name, (r2d(vt), axes[1].get_ylim()[0]), fontsize=6,
+                             rotation=90, va="bottom", ha="right", color="0.3")
+    axes[1].annotate("mesh pole", (90.0, axes[1].get_ylim()[0]), fontsize=7,
                      rotation=90, va="bottom", ha="right")
 
     fig.tight_layout()
@@ -1664,8 +1708,16 @@ def test_plot_fg_derivatives(output_file: str = None):
 
 if __name__ == "__main__":
 
+    print("Plotting f' and g' for each formulation...")
+    test_plot_fg_derivatives(output_file="figure_fg_derivative_logcosh.png",
+                             formulation="logcosh", v_min_degree=-90.0)
+    test_plot_fg_derivatives(output_file="figure_fg_derivative_cubic.png",
+                             formulation="cubic")
+    test_plot_fg_derivatives(output_file="figure_fg_derivative_polystep.png",
+                             formulation="polystep", dlat_in_SH_degree=1.5)
+
+
     print("Plotting grid...")
-    test_plot_fg_derivatives(output_file="figure_fg_derivative.png")
     test_plot_grid_naive()
     test_plot_grid()
     test_output_SCRIP_file()
