@@ -990,6 +990,106 @@ class FGPolynomialStep(FGBase):
         ]
 
 
+class FGLinear(FGBase):
+    """
+    The simplest formulation that still carries a monotonicity guarantee: the
+    RATE is linear in v, so f and g are quadratics.
+
+        f'(v) = a + b v          f(v) = c0 + a v + (b/2) v^2
+
+    "Linear" refers to the derivative, not to f itself.
+
+    Three unknowns per branch and three conditions, and they unwind one at a
+    time -- there is no linear system to assemble at all:
+
+        f(0)      = -1     ->  c0 = -1
+        f'(0)     = s0     ->  a  = s0
+        f(v_max)  = y_NP   ->  b  = 2 (y_NP + 1 - s0 v_max) / v_max^2
+
+    and the polar rate follows as an outcome,
+
+        f'(v_max) = 2 (y_NP + 1)/v_max - s0 = 2 <f'> - s0
+
+    Monotonicity
+    ------------
+    A linear f' is monotone in v, so it is trapped between its endpoint values.
+    Hence f is strictly increasing exactly when s0 > 0 and f'(v_max) > 0, both
+    known in closed form before anything is evaluated. Same guarantee as
+    FGPolynomialStep, obtained the same way, with less machinery.
+
+    Relation to FGPolynomialStep
+    ---------------------------
+    The two schemes share their endpoint algebra exactly, including the binding
+    constraint on the g branch,
+
+        s0 < 2 (1 - y_NP) / v_max
+
+    because both satisfy <f'> = (f'(0) + f'(v_max))/2 -- trivially for a
+    straight line, and for gamma because it integrates to 1/2 over [0, 1]. The
+    geometry fixes <f'> = (y_NP + 1)/v_max, so both end up with the same
+    relation between s0 and the polar rate.
+
+    What FGPolynomialStep buys over this is therefore only the SHAPE between the
+    endpoints: gamma is flat at both ends (f'' = 0 there) and concentrates the
+    change in the middle, whereas here the rate changes at a constant pace
+    throughout. That matters mainly at the equator, where the northern branch
+    meets a uniform southern lat-lon patch and a settled rate makes the join
+    smoother than C1.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator):              # [rad lat / rad v]
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    def _solve(self):
+        V = self.v_max
+        self.c0_f, self.a_f = -1.0, +self.s0
+        self.c0_g, self.a_g = +1.0, -self.s0
+        self.b_f = 2.0*(self.y_NP - self.c0_f - self.a_f*V) / V**2
+        self.b_g = 2.0*(self.y_NP - self.c0_g - self.a_g*V) / V**2
+
+    def f(self, v):
+        return self.c0_f + self.a_f*v + 0.5*self.b_f*v**2
+
+    def dfdv(self, v):
+        return self.a_f + self.b_f*v
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        return self.c0_g + self.a_g*v + 0.5*self.b_g*v**2
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        return self.a_g + self.b_g*v
+
+    def max_dlat_dv_equator(self):
+        """
+        Largest s0 keeping both branches monotone. f needs f'(v_max) > 0 and g
+        needs g'(v_max) < 0; substituting the closed forms gives
+        2(1 + y_NP)/v_max and 2(1 - y_NP)/v_max respectively, and since y_NP > 0
+        for a mesh pole in the northern hemisphere it is always g that binds.
+        """
+        V = self.v_max
+        return min(2.0*(1.0 + self.y_NP)/V, 2.0*(1.0 - self.y_NP)/V)
+
+    def _scheme_checks(self):
+        """
+        The two endpoint rates are the whole monotonicity question here, since a
+        linear f' cannot leave the interval spanned by its ends.
+        """
+        return [
+            ("f'(v_max) > 0 (outcome)", self.dfdv(self.v_max), 0.0, "gt"),
+            ("g'(v_max) < 0 (outcome)", self.dgdv(self.v_max), 0.0, "lt"),
+        ]
+
+
 class DisplacedPoleGrid:
     """
     Displaced Pole Grid
@@ -1461,6 +1561,13 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
             v_trans_g                = d2r(30.0),   # polar knee, g
             v_trans_g_width          = d2r(10.0),
         )
+    elif formulation == "linear":
+        # same binding constraint as polystep, s0 < 2(1 - y_NP)/v_max, so the
+        # same 1.5 deg equatorial resolution is needed at 30 northern rows.
+        fg = FGLinear(
+            displaced_north_pole_lat = d2r(40.0),
+            dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
+        )
     elif formulation == "polystep":
         # gamma keeps the rate trapped between its endpoints only while the
         # g branch stays monotone, which needs s0 below roughly
@@ -1519,23 +1626,31 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
     write_to_2D_grid_file(mesh, twod_file)
 
 
-def test_plot_grid_naive():
+def test_plot_grid_naive(output_file: str = None,
+                             formulation: str = "logcosh",
+                             v_min_degree: float = 0.0,
+                             **grid_kwargs):
+ 
     import matplotlib.pyplot as plt
 
-    grid = build_example_grid()
+    grid = build_example_grid(formulation=formulation, **grid_kwargs)
 
-    start_lons = np.deg2rad([0, 90, 180, 270])
+    start_lons = np.deg2rad(np.linspace(0, 360, 10)[:-1])
     I_curves = [ grid.generate_I_curve(lon) for lon in start_lons ]
+    
+    start_lats = np.deg2rad(np.linspace(-90, 90, 20))
+    J_curves = [ grid.generate_J_curve(lat) for lat in start_lats ]
 
     fig, ax = plt.subplots(1, 1, subplot_kw={"projection": "3d"})
     ax.view_init(azim=-30, elev=45, roll=0)
 
-    for i, pts in enumerate(I_curves):
-        xyz = spherical_to_cartesian(pts)
-        x = xyz[0, :]
-        y = xyz[1, :]
-        z = xyz[2, :]
-        ax.plot(x, y, z, lw=0.9)
+    for curves in [ I_curves, J_curves ]:
+        for i, pts in enumerate(curves):
+            xyz = spherical_to_cartesian(pts)
+            x = xyz[0, :]
+            y = xyz[1, :]
+            z = xyz[2, :]
+            ax.plot(x, y, z, lw=0.9)
 
     ax.set_xlabel("x-direction")
     ax.set_ylabel("y-direction")
@@ -1709,16 +1824,19 @@ def test_plot_fg_derivatives(output_file: str = None,
 if __name__ == "__main__":
 
     print("Plotting f' and g' for each formulation...")
-    test_plot_fg_derivatives(output_file="figure_fg_derivative_logcosh.png",
-                             formulation="logcosh", v_min_degree=-90.0)
-    test_plot_fg_derivatives(output_file="figure_fg_derivative_cubic.png",
-                             formulation="cubic")
+    #test_plot_fg_derivatives(output_file="figure_fg_derivative_logcosh.png",
+    #                         formulation="logcosh", v_min_degree=-90.0)
+    #test_plot_fg_derivatives(output_file="figure_fg_derivative_cubic.png",
+    #                         formulation="cubic")
     test_plot_fg_derivatives(output_file="figure_fg_derivative_polystep.png",
-                             formulation="polystep", dlat_in_SH_degree=1.5)
+                             formulation="polystep", dlat_in_SH_degree=3)
 
 
     print("Plotting grid...")
-    test_plot_grid_naive()
-    test_plot_grid()
-    test_output_SCRIP_file()
+    test_plot_grid_naive(
+        formulation="polystep",
+        dlat_in_SH_degree=3
+    )
+    #test_plot_grid()
+    #test_output_SCRIP_file()
 
