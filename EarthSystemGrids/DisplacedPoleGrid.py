@@ -2,6 +2,7 @@ import abc
 import functools
 
 import numpy as np
+from scipy.optimize import brentq
 
 # The northern branch runs from the equator to the mesh north pole, and the
 # pseudo-latitude v mirrors geographic latitude, so the pole sits at v = pi/2.
@@ -1117,210 +1118,183 @@ class FGLinear(FGBase):
 
 class FGTanh(FGBase):
     """
-    An adaptation of Madec and Imbard (1996), first define f' and g' as
+    An adaptation of Madec and Imbard (1996): define the RATE as a constant plus
+    a single hyperbolic tangent, so it is a smooth step between two levels.
 
-        f'(v) =   C1_f - W_f * tanh( (v - v_c) / delta_v_f)
-        g'(v) = - C1_g + W_g * tanh( (v - v_c) / delta_g_f)
+        f'(v) =   C1_f - W_f tanh( (v - v_c_f) / delta_f )
+        g'(v) = - C1_g + W_g tanh( (v - v_c_g) / delta_g )
 
-    After integration, we find
+    Integrating (the antiderivative of tanh(x/d) is d logcosh(x/d), NOT tanh):
 
-        f(v) = C0_f + C1_f v - (A_f/delta_v_f) * tanh( (v - v_c_f) / delta_v_f)
-        g(v) = C0_g - C1_g v + (A_g/delta_v_g) * tanh( (v - v_c_g) / delta_v_g)
+        f(v) = C0_f + C1_f v - W_f delta_f logcosh( (v - v_c_f) / delta_f )
+        g(v) = C0_g - C1_g v + W_g delta_g logcosh( (v - v_c_g) / delta_g )
 
-    Boundary conditions
-    -------------------
-        f(0) = -1                    g(0) = +1
-        dfdv(0) = s0                 dgdv(0) = -s0        (C1 across the equator)
-        dfdv(v_polar) = s_polar_f    dgdv(v_polar) = s_polar_g
-        f(v_max) = y_NP              g(v_max) = y_NP
+    Boundary conditions, four per branch
+    -----------------------------------
+        f(0) = -1                  g(0) = +1
+        dfdv(0) = s0               dgdv(0) = -s0        (C1 across the equator)
+        f(v_max) = f_target        g(v_max) = g_target
+        dfdv(v_max) = s_f          dgdv(v_max) = s_g
 
-    Since delta_v are given, f comes with four unknowns: C0_f, C1_f, A_f, and v_c_f.
-    g also comes with four unknowns: C0_g, C1_g, A_g, and v_c_g.
+    The widths delta are given, so each branch has four unknowns -- C0, C1, W and
+    v_c -- matching its four conditions.
 
-    
+    Why this scheme is worth the root-find
+    -------------------------------------
+    tanh is monotone on the WHOLE line, so f' is monotone in v and therefore
+    trapped between its two endpoint values -- and here both endpoints are
+    inputs. Hence
 
-    # The functions f and g, and how to solve them
+        f strictly increasing  <=>  s0 > 0 and s_f > 0
+        g strictly decreasing  <=>  s0 > 0 and s_g < 0
 
-    The function f is found by first defining its derivative, df/dv, with respect to pseudo
-    latitude because the resolution of grid along the y-axis, degrees per grid, corresponds
-    to scale factor along the y-axis. 
+    guaranteed by construction, with nothing to sample and no region test.
 
-    In Madec and Imbard (1996) they use hyperbolic tangent to construct the resolution dg/dj.
-    It is useful, but I alternate the way to prettify the math. First of all, dg/dj depends on
-    the grid resolution, and g' = g'(j) is difficult when designing the function. Therefore,
-    I enforce every expression to be in pseudo-latitude v. The only exception is that users
-    provide resolution dlat/dj because that is intuitive. The dlat/dj will translate into dg/dv
-    through the chain rule, as will be explained in later sections.
+    More importantly, <f'> is NOT pinned to (f'(0) + f'(v_max))/2, because v_c is
+    free to move. FGLinear and FGPolynomialStep are both locked to that average
+    -- trivially for a straight line, and for gamma because it integrates to 1/2
+    over [0, 1] -- which forces g'(v_max) = 2<g'> - g'(0) and makes g reverse
+    once s0 exceeds 2(1 - g_target)/v_max. This scheme escapes that entirely, so
+    it accepts equatorial resolutions the others reject.
 
-    The df/dv and dg/dv are designed as a sum of pleateau-shaped functions beta. 
+    Solving
+    -------
+    The two slope conditions give W and C1 in closed form for any v_c, and the
+    two value conditions collapse to a single scalar equation for v_c, solved by
+    bisection. Fixing the width and solving for the location (rather than the
+    reverse) matters: v_c is a LOCATION, so a few widths either side of
+    [0, v_max] brackets every case, whereas a width is a SCALE needing a
+    geometric sweep with no natural upper cut -- and a root found at an absurd
+    width satisfies the conditions while making the tanh linear across the whole
+    domain, silently destroying the shape that was asked for. Measured over a
+    sweep of (s0, s_polar), solving for v_c found a usable answer roughly three
+    times as often.
 
-        df/dv(v)   = A1 - W^f_trop * dbeta^f_trop/dv + W^f_polar * dbeta^f_polar/dv
-        dg/dv(v<0) = -df/dv
-        dg/dv(v>0) = -B1 - W^g_polar * dbeta^g_polar/dv
-
-    where A1 and B1 are the base resolution, W is the amplitude of the resolution transition,
-    with supscript being the function it belongs to and subscript being the location the transition
-    happens. Because f' > 0 and g' < 0 are two necessary conditions, the signs are chosen so that
-    we should expect W terms to be positive to be physically interpretable. The function dbeta/dv
-    is made of two hyperbolic tangents,
-
-        dbeta/dv(v) = c ( tanh((v+v_tran)/Delta_v) + tanh((v-v_tran)/Delta_v) )
-
-    where v_tran is the transition latitude, Delta_v the transition width, and c the normalization
-    constant such that dbeta/dv(v=0) = 1.
-
-    The f and g follows
-
-        f(v)   = A0 + A1 v - W^f_trop * beta^f_trop + W^f_polar * beta^f_polar
-        g(v<0) = -f
-        g(v>0) = B0 - B1 v - W^g_polar * beta^g_polar
-
-    Because Claude points out that the paper's boundary conditions do not seem to satisfy the 
-    condition that f(v=90deg) = g(v=90deg), I decide to do it in my way. So, the system I am 
-    solving is
-
-        Unknowns: A0, A1, B0, B1, W^f_trop, W^f_polar, and W^g_polar.
-        Boundary conditions:
-            
-            (1) f(0) = -1         => A0 = -1
-            (2) g(0) =  1         => B0 =  1
-            (3) df/dv(v_trop) =   s_trop
-            (4) dg/dv(v_trop) = - s_trop
-            (5) f(90deg) = y_np
-            (6) g(90deg) = y_np
-            (7) f'(v_polar) = s_polar
-
-    where s_0 and s_g is the resolution at the equator and the maximum latitude of the grid,
-    and y_np being the y location of the displaced north pole.
-
-    # How to see df/dv and dg/dv encompass grid resolution
-
-    The scale factor along the meridional direction is
-
-        e_2 = a sqrt( (dlon/dj * cos(lat))^2 + (dlat/dj)^2 )
-
-    where j is the grid index. Evaluate the trajectory tracking the y-axis intercept
-    (x, y) = (0, g(u)) gives
-
-        e_2 = a dlat/dj
-            = a d/dj (pi/2 - 2 arctan(|g|) )
-            = -2 a sgn(g) / (1 + g^2) * (dg/dv) (dv/dj) 
-    
-    Rearranging the above gives
-
-        dg/dv = -1/2 (dlat/dj) sgn(g) (1+g^2) / (dv/dj)
-
-    and similarly for f
-        
-        df/dv = -1/2 (dlat/dj) sgn(f) (1+f^2) / (dv/dj)
-
-    This is a pratical expression because user can specify the grid resolution dlat/dj
-    and obtain df/dv for a particular location.
+    A v_c outside [0, v_max] is normal and healthy: it just means the knee sits
+    beyond the domain and only its tail is used.
     """
 
     def __init__(self,
                  displaced_north_pole_lat,      # [rad]
                  dlat_dv_equator,               # [rad lat / rad v]
-                 dlat_dv_polar,                 # [rad lat / rad v] at v_polar
-                 v_polar,                       # [rad] where dlat_dv_polar applies
-                 v_trans_tropics_f,             # [rad]
-                 v_trans_width_tropics_f,       # [rad]
-                 v_trans_polar_f,               # [rad]
-                 v_trans_width_polar_f,         # [rad]
-                 v_trans_g,                     # [rad]
-                 v_trans_g_width):              # [rad]
-        super().__init__(displaced_north_pole_lat, dlat_dv_equator)
-        self.dlat_dv_polar = dlat_dv_polar
-        self.v_polar = v_polar
-        self.v_trans_tropics_f = v_trans_tropics_f
-        self.v_trans_width_tropics_f = v_trans_width_tropics_f
-        self.v_trans_polar_f = v_trans_polar_f
-        self.v_trans_width_polar_f = v_trans_width_polar_f
-        self.v_trans_g = v_trans_g
-        self.v_trans_g_width = v_trans_g_width
+                 dlat_dv_polar_f,               # [rad lat / rad v] at v_max, f branch
+                 dlat_dv_polar_g,               # [rad lat / rad v] at v_max, g branch
+                 v_width_f,                     # [rad] delta_f, given
+                 v_width_g=None,                # [rad] delta_g, defaults to v_width_f
+                 ring_radius=0.0):              # [dimensionless] last-ring radius
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, ring_radius)
+        self.v_width_f = v_width_f
+        self.v_width_g = v_width_f if v_width_g is None else v_width_g
+
+        # both targets lie past the f-branch zero crossing, so use the
+        # continued-latitude Jacobians rather than the folded sign() form
+        self.s_f = self.dlat_dv_to_dfdv(dlat_dv_polar_f, self.f_target)
+        self.s_g = self.dlat_dv_to_dgdv(dlat_dv_polar_g, self.g_target)
 
         self._solve()
         if not self.verify(verbose=False):
             print(f"{type(self).__name__}: verify() reported failures; "
                   f"call verify() for the detail.")
 
+    # ---- one branch ---------------------------------------------------------
+
+    def _branch(self, value_0, value_max, slope_0, slope_max, w, sign):
+        """
+        Solve one branch. `sign` is +1 for f and -1 for g, matching the sign
+        conventions in the class docstring, so that W comes out positive for the
+        usual case of a rate that falls toward the pole.
+
+        Returns (C0, C1, W, v_c).
+        """
+        V = self.v_max
+
+        def closed_form(v_c):
+            t0 = np.tanh(-v_c/w)
+            tV = np.tanh((V - v_c)/w)
+            if abs(tV - t0) < 1e-13:
+                return None                      # both tails saturated, W blows up
+            W  = (sign*slope_0 - sign*slope_max) / (tV - t0)
+            C1 = sign*slope_0 + W*t0
+            return W, C1
+
+        def residual(v_c):
+            r = closed_form(v_c)
+            if r is None:
+                return np.nan
+            W, C1 = r
+            L0 = _logcosh(-v_c/w)
+            LV = _logcosh((V - v_c)/w)
+            # value_max - value_0 = sign*C1*V - sign*W*w*(LV - L0)
+            return sign*C1*V - sign*W*w*(LV - L0) - (value_max - value_0)
+
+        # v_c is a LOCATION, so a few widths either side of the domain brackets it
+        grid = np.linspace(-4.0*w, V + 4.0*w, 4001)
+        vals = np.array([residual(x) for x in grid])
+        ok = np.isfinite(vals)
+        cross = np.where(ok[:-1] & ok[1:] &
+                         (np.sign(vals[:-1])*np.sign(vals[1:]) < 0))[0]
+        if len(cross) == 0:
+            raise ValueError(
+                "FGTanh: no v_c in [-4 delta, v_max + 4 delta] satisfies the two "
+                "value conditions for this combination of rates and width. A "
+                "narrower delta, or endpoint rates closer to the mean the "
+                "geometry demands, will usually admit a solution.")
+        v_c = brentq(residual, grid[cross[0]], grid[cross[0]+1], xtol=1e-15)
+        W, C1 = closed_form(v_c)
+        C0 = value_0 + sign*W*w*_logcosh(-v_c/w)
+        return C0, C1, W, v_c
+
+    def _solve(self):
+        self.C0_f, self.C1_f, self.W_f, self.v_c_f = self._branch(
+            -1.0, self.f_target, +self.s0, self.s_f, self.v_width_f, +1.0)
+        self.C0_g, self.C1_g, self.W_g, self.v_c_g = self._branch(
+            +1.0, self.g_target, -self.s0, self.s_g, self.v_width_g, -1.0)
+
+    # ---- the interface ------------------------------------------------------
+
     def f(self, v):
-        return -1.0 + self.A1 * v + (
-            - self.W_tropics_f * beta(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
-            + self.W_polar_f * beta(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
-        )
+        w = self.v_width_f
+        return (self.C0_f + self.C1_f*v
+                - self.W_f*w*_logcosh((v - self.v_c_f)/w))
 
     def dfdv(self, v):
-        return self.A1 + (
-            - self.W_tropics_f * dbeta_dv(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
-            + self.W_polar_f * dbeta_dv(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
-        )
+        return self.C1_f - self.W_f*np.tanh((v - self.v_c_f)/self.v_width_f)
 
     def g(self, v):
         if v < 0:
             return - self.f(v)
-        else:
-            return 1.0 - self.B1 * v - (
-                self.W_g * beta(v, self.v_trans_g, self.v_trans_g_width)
-            )
+        w = self.v_width_g
+        return (self.C0_g - self.C1_g*v
+                + self.W_g*w*_logcosh((v - self.v_c_g)/w))
 
     def dgdv(self, v):
         if v < 0:
             return - self.dfdv(v)
-        else:
-            return - self.B1 - (
-                self.W_g * dbeta_dv(v, self.v_trans_g, self.v_trans_g_width)
-            )
+        return -self.C1_g + self.W_g*np.tanh((v - self.v_c_g)/self.v_width_g)
 
     def transition_marks(self):
-        return [
-            (self.v_trans_tropics_f, "v_trans_tropics_f"),
-            (self.v_trans_polar_f,   "v_trans_polar_f"),
-            (self.v_trans_g,         "v_trans_g"),
-            (self.v_polar,           "v_polar"),
-        ]
-
-    def _solve(self):
-        v_star = -np.abs(self.v_polar)
-        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
-
-        s0     = self.s0
-        s_star = self.dlat_dv_to_dwdv(self.dlat_dv_polar, y_star)
-        self._s_star = s_star
-        self._v_star = v_star
-
-        # g: 2 unknowns from dgdv(0) = -s0 and g(v_max) = y_NP
-        self.B1, self.W_g = np.linalg.solve(
-            np.array([
-                [1,          dbeta_dv(0.0, self.v_trans_g, self.v_trans_g_width)],
-                [self.v_max, beta(self.v_max, self.v_trans_g, self.v_trans_g_width)],
-            ]),
-            np.array([s0, 1 - self.y_NP]),
-        )
-
-        # f: 3 unknowns from dfdv(0) = s0, dfdv(v_star) = s_star, f(v_max) = y_NP.
-        # The third is a VALUE condition, so its amplitude entries are beta, not
-        # dbeta_dv -- the single easiest thing to get wrong here.
-        tt, wt = self.v_trans_tropics_f, self.v_trans_width_tropics_f
-        tp, wp = self.v_trans_polar_f,   self.v_trans_width_polar_f
-        self.A1, self.W_polar_f, self.W_tropics_f = np.linalg.solve(
-            np.array([
-                [1,          dbeta_dv(0.0,       tp, wp), -dbeta_dv(0.0,       tt, wt)],
-                [1,          dbeta_dv(v_star,    tp, wp), -dbeta_dv(v_star,    tt, wt)],
-                [self.v_max, beta(self.v_max,    tp, wp), -beta(self.v_max,    tt, wt)],
-            ]),
-            np.array([s0, s_star, 1 + self.y_NP]),
-        )
+        marks = [(self.v_c_f, "v_c_f")]
+        if abs(self.v_c_g - self.v_c_f) > 1e-12:
+            marks.append((self.v_c_g, "v_c_g"))
+        return marks
 
     def _scheme_checks(self):
+        """
+        Monotonicity needs no test of its own: tanh keeps each rate trapped
+        between its endpoints, and both endpoints are imposed. What is worth
+        reporting is the solved knee locations, since a v_c far outside the
+        domain means the tanh is running as a near-straight line and the width
+        has stopped meaning anything.
+        """
+        V = self.v_max
         return [
-            ("dfdv(v_polar) = s_polar", self.dfdv(self._v_star), self._s_star, "eq"),
-            ("design: W_polar_f   > 0", self.W_polar_f,          0.0,          "gt"),
-            ("design: W_tropics_f > 0", self.W_tropics_f,        0.0,          "gt"),
-            ("design: W_g         > 0", self.W_g,                0.0,          "gt"),
+            ("dfdv(v_max) = s_f",  self.dfdv(V), self.s_f, "eq"),
+            ("dgdv(v_max) = s_g",  self.dgdv(V), self.s_g, "eq"),
+            ("v_c_f within 4 delta of domain",
+             4.0*self.v_width_f - abs(self.v_c_f - 0.5*V) + 0.5*V, 0.0, "gt"),
+            ("v_c_g within 4 delta of domain",
+             4.0*self.v_width_g - abs(self.v_c_g - 0.5*V) + 0.5*V, 0.0, "gt"),
         ]
-
-
 
 
 class DisplacedPoleGrid:
@@ -1670,6 +1644,46 @@ class DisplacedPoleMesh:
         return self.center_lon.shape
 
 
+def apply_ocean_mask(mesh: DisplacedPoleMesh):
+    """
+    Set mesh.mask from a real coastline: 1 over ocean, 0 over land.
+
+    Uses the `global_land_mask` package, whose data is bundled with it, so this
+    needs no network access. Its grid is 1/4 degree, derived from Natural Earth.
+
+    The test is on the CELL CENTRE, which is the usual convention and what
+    ESMF_RegridWeightGen assumes when it reads grid_imask -- a cell is either
+    wholly in or wholly out. Near a coastline that is a coin flip decided by
+    where the centre happens to fall, so a cell straddling the shore is kept or
+    dropped whole. That is only meaningful while the cells are small compared
+    with the coastline features; this mesh has cells of a few hundred km near
+    the equator, so treat the result as indicative rather than as a model land
+    mask.
+
+    Note the mesh pole sits over land by design -- that is the entire point of
+    the construction -- so the cells around it should mask out, and their being
+    masked is a useful check that the pole landed where it was meant to.
+
+    Modifies mesh in place and returns it.
+    """
+    try:
+        from global_land_mask import globe
+    except ImportError as exc:
+        raise ImportError(
+            "apply_ocean_mask needs the `global_land_mask` package "
+            "(pip install global-land-mask). It bundles its own data, so no "
+            "download is required at run time.") from exc
+
+    lat = np.rad2deg(mesh.center_lat)
+    lon = np.rad2deg(mesh.center_lon)
+    # the package wants lon in [-180, 180) and lat strictly inside the poles
+    lon = (lon + 180.0) % 360.0 - 180.0
+    lat = np.clip(lat, -89.999, 89.999)
+
+    mesh.mask = np.where(globe.is_land(lat, lon), 0, 1).astype(np.int32)
+    return mesh
+
+
 def write_to_SCRIP_grid_file(mesh: DisplacedPoleMesh, output_file, flatten: bool = True):
     """
     Write `mesh` as a SCRIP grid file, readable by ESMF_RegridWeightGen.
@@ -1811,6 +1825,33 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
             v_width_f                = V_MAX,
         )
+    elif formulation == "tanh":
+        # Tuned so that dg/dv is as nearly constant as the geometry allows.
+        #
+        # dg/dv is monotone and trapped between its endpoints, so its total
+        # variation is exactly |s_g + s0| = s0 - |s_g|. Feasibility squeezes both
+        # ends onto the same number: the mean the geometry demands must lie
+        # inside the interval the endpoints span, giving
+        #
+        #     s0 >= |mean_g|   and   |s_g| <= |mean_g|,
+        #     |mean_g| = (1 - g_target)/v_max = 0.339759 for a 40 N pole
+        #
+        # so the variation is squeezed from both sides towards zero. Sitting
+        # exactly on it would make W_g vanish, leaving v_c undetermined and the
+        # root-find degenerate, so approach instead: these are 1.002 and 0.999
+        # times |mean_g|, giving a 0.3 % spread in dg/dv.
+        #
+        # The cost falls entirely on f, and unavoidably. C1 ties the two
+        # starting rates together while the branches' means differ by 2.75x, so
+        # flattening one steepens the other -- df/dv spreads by 94 % here.
+        fg = FGTanh(
+            displaced_north_pole_lat = d2r(40.0),
+            dlat_dv_equator          = 0.340439,   # 1.0213 deg/row, just above |mean_g|
+            dlat_dv_polar_f          = 2.000000,   # 6.0 deg/row
+            dlat_dv_polar_g          = 0.557594,   # 1.6728 deg/row, just below |mean_g|
+            v_width_f                = d2r(30.0),
+            v_width_g                = d2r(30.0),
+        )
     elif formulation == "cubic":
         fg = FGCubic(
             displaced_north_pole_lat = d2r(40.0),
@@ -1833,13 +1874,15 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
 
 
 def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
-                           twod_file: str = "grid_displaced_pole_2D.nc"):
+                           twod_file: str = "grid_displaced_pole_2D.nc",
+                           formulation: str = "logcosh",
+                           mask_land: bool = True, **grid_kwargs):
     """
     Write both output files: the SCRIP grid for ESMF_RegridWeightGen, and a
     plain (j, i) file that ncview can display directly.
     """
     print("Generating grid...")
-    grid = build_example_grid()
+    grid = build_example_grid(formulation=formulation, **grid_kwargs)
     print(f"  formulation: {type(grid.fg).__name__}")
 
     print("Assembling mesh...")
@@ -1851,6 +1894,15 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
     print(f"  e1 {mesh.e1.min()/1e3:.1f} .. {mesh.e1.max()/1e3:.1f} km, "
           f"e2 {mesh.e2.min()/1e3:.1f} .. {mesh.e2.max()/1e3:.1f} km")
     print(f"  total solid angle {mesh.area.sum():.6f} sr")
+
+    if mask_land:
+        apply_ocean_mask(mesh)
+        ocean = mesh.mask.sum()
+        # area-weighted, since the cells are wildly unequal on this mesh
+        frac = (mesh.area*mesh.mask).sum()/mesh.area.sum()
+        print(f"  ocean mask: {ocean} of {mesh.mask.size} cells wet "
+              f"({100*ocean/mesh.mask.size:.1f}% by count, "
+              f"{100*frac:.1f}% by area)")
 
     print("Writing to file: ", scrip_file)
     write_to_SCRIP_grid_file(mesh, scrip_file)
@@ -1892,7 +1944,8 @@ def test_plot_grid_naive(output_file: str = None,
     ax.set_xlim(lim); ax.set_ylim(lim); ax.set_zlim(lim)
     plt.show()
 
-def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None):
+def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None,
+                   formulation: str = "logcosh", **grid_kwargs):
     """
     Draw the mesh lines on the sphere. Every stride_j-th row and stride_i-th
     column of the assembled mesh is shown, so what is plotted is exactly what
@@ -1900,7 +1953,7 @@ def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None
     """
     import matplotlib.pyplot as plt
 
-    grid = build_example_grid()
+    grid = build_example_grid(formulation=formulation, **grid_kwargs)
     mesh = grid.generate_mesh()
     lon = mesh.corner_lon[:, :, 0]
     lat = mesh.corner_lat[:, :, 0]
@@ -2056,20 +2109,28 @@ def test_plot_fg_derivatives(output_file: str = None,
 
 if __name__ == "__main__":
 
+    # Each formulation needs its own equatorial resolution. The locked schemes
+    # (linear, polystep) cap s0 at 2(1 - g_target)/v_max, which is 0.68 for a
+    # 40 N pole, so they need a finer equator than the 3 deg default.
+    FORMULATIONS = [
+        ("tanh",     dict()),
+        #("logcosh",  dict(v_min_degree=-90.0)),
+        #("cubic",    dict()),
+        #("polystep", dict(dlat_in_SH_degree=1.5)),
+        #("linear",   dict(dlat_in_SH_degree=1.5)),
+
+    ]
+
     print("Plotting f' and g' for each formulation...")
-    #test_plot_fg_derivatives(output_file="figure_fg_derivative_logcosh.png",
-    #                         formulation="logcosh", v_min_degree=-90.0)
-    #test_plot_fg_derivatives(output_file="figure_fg_derivative_cubic.png",
-    #                         formulation="cubic")
-    test_plot_fg_derivatives(output_file="figure_fg_derivative_polystep.png",
-                             formulation="linear", dlat_in_SH_degree=3)
+    for name, kwargs in FORMULATIONS:
+        test_plot_fg_derivatives(output_file=f"figure_fg_derivative_{name}.png",
+                                 formulation=name, **kwargs)
 
+    print("Plotting the mesh for FGTanh...")
+    test_plot_grid(formulation="tanh", output_file="figure_grid_tanh.png",
+                   stride_j=4, stride_i=6)
 
-    print("Plotting grid...")
-    test_plot_grid_naive(
-        formulation="linear",
-        dlat_in_SH_degree=3
-    )
-    #test_plot_grid()
-    #test_output_SCRIP_file()
-
+    print("Writing grid files for FGTanh...")
+    test_output_SCRIP_file(scrip_file="grid_displaced_pole_tanh_SCRIP.nc",
+                           twod_file="grid_displaced_pole_tanh_2D.nc",
+                           formulation="tanh")
