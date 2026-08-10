@@ -1792,14 +1792,23 @@ def write_to_2D_grid_file(mesh: DisplacedPoleMesh, output_file):
     ds.to_netcdf(output_file)
 
 
-def build_example_grid(pole_longitude_degree: float = 90.0,
+def build_example_grid(pole_longitude_degree: float = None,
                        number_of_rows_in_NH: int = 30,
                        number_of_columns: int = 120,
                        dlat_in_SH_degree: float = 3.0,
                        southern_edge_degree: float = -90.0,
                        formulation: str = "logcosh"):
     """
-    A worked example: mesh pole over China at 40 N / 90 E, tropical refinement,
+    A worked example with a plain lat-lon southern patch and tropical refinement.
+
+    Each formulation carries its own default mesh pole, since the pole latitude
+    belongs to the formulation while the longitude belongs to the grid, and the
+    two only make sense together -- a latitude that sits on land at one longitude
+    sits in open ocean at another. Pass pole_longitude_degree to override.
+
+        logcosh / cubic / polystep / linear   40 N,  90 E   (western China)
+        tanh                                  72 N,  40 W   (Greenland)
+
     and a plain lat-lon southern patch.
 
     dlat_in_SH_degree is also used as the equatorial meridional resolution, so
@@ -1819,6 +1828,7 @@ def build_example_grid(pole_longitude_degree: float = 90.0,
     dvdj = V_MAX / number_of_rows_in_NH
 
     if formulation == "logcosh":
+        default_pole_lon = 90.0
         fg = FGLogCosh(
             displaced_north_pole_lat = d2r(40.0),   # mesh north pole latitude
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
@@ -1832,6 +1842,7 @@ def build_example_grid(pole_longitude_degree: float = 90.0,
             v_trans_g_width          = d2r(10.0),
         )
     elif formulation == "linear":
+        default_pole_lon = 90.0
         # same binding constraint as polystep, s0 < 2(1 - y_NP)/v_max, so the
         # same 1.5 deg equatorial resolution is needed at 30 northern rows.
         fg = FGLinear(
@@ -1839,6 +1850,7 @@ def build_example_grid(pole_longitude_degree: float = 90.0,
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
         )
     elif formulation == "polystep":
+        default_pole_lon = 90.0
         # gamma keeps the rate trapped between its endpoints only while the
         # g branch stays monotone, which needs s0 below roughly
         # 2(1 - y_NP)/v_max -- i.e. the equator must be finer than uniform.
@@ -1849,22 +1861,26 @@ def build_example_grid(pole_longitude_degree: float = 90.0,
             v_width_f                = V_MAX,
         )
     elif formulation == "tanh":
+        # Mesh pole on the Greenland ice sheet, 72 N / 40 W. The construction
+        # always builds it at 90 E, so the grid rotates the whole mesh about the
+        # Earth's axis to get it there -- see DisplacedPoleGrid.pole_longitude.
+        #
         # FGTanh takes all four rates as inputs, so feasibility is a condition on
         # the whole set, not on s0 alone. Each rate is trapped between its
         # endpoints, so the mean the geometry demands must lie between them:
         #
-        #     min(s0, s_f)  <= (y_NP + 1)/v_max <= max(s0, s_f)
-        #     s0 >= |mean_g|   and   |s_g| <= |mean_g|
+        #     min(s0, s_f) <= mean_f <= max(s0, s_f),   mean_f  = 0.7374
+        #     s0 >= |mean_g|  and  |s_g| <= |mean_g|,   |mean_g| = 0.5358
         #
-        # The variation of dg/dv is exactly s0 - |s_g|, so it is minimised by
-        # pushing both onto |mean_g| = (1 - g_target)/v_max -- for a 75 N pole
-        # that is 0.5528, an equatorial spacing of 1.66 deg/row. The settings
-        # below do NOT sit there: they keep the 3 deg equator, which leaves
-        # dg/dv spread over about 130 %. Lower dlat_dv_equator towards |mean_g|
-        # to flatten it, at the cost of steepening df/dv, since C1 ties the two
-        # starting rates together.
+        # satisfied here by s0 = 1.0000, s_f = 0.5125, s_g = -0.2858.
+        #
+        # dg/dv varies by exactly s0 - |s_g| = 0.714, about 130 % of its mean.
+        # Flattening it means pushing both onto |mean_g|, i.e. dropping the
+        # equator to 1.607 deg/row, which steepens df/dv in exchange -- C1 ties
+        # the two starting rates together, so one branch can be flat but not both.
+        default_pole_lon = -40.0
         fg = FGTanh(
-            displaced_north_pole_lat = d2r(75.0),
+            displaced_north_pole_lat = d2r(72.0),
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
             dlat_dv_polar_f          = 1.000000,
             dlat_dv_polar_g          = 0.557594,
@@ -1872,6 +1888,7 @@ def build_example_grid(pole_longitude_degree: float = 90.0,
             v_width_g                = d2r(30.0),
         )
     elif formulation == "cubic":
+        default_pole_lon = 90.0
         fg = FGCubic(
             displaced_north_pole_lat = d2r(40.0),
             dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
@@ -1880,6 +1897,9 @@ def build_example_grid(pole_longitude_degree: float = 90.0,
         )
     else:
         raise ValueError(f"unknown formulation {formulation!r}")
+
+    if pole_longitude_degree is None:
+        pole_longitude_degree = default_pole_lon
 
     return DisplacedPoleGrid(
         fg                       = fg,
