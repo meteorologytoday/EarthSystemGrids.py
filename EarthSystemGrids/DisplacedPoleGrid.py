@@ -1849,8 +1849,8 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
             dlat_dv_equator          = 0.340439,   # 1.0213 deg/row, just above |mean_g|
             dlat_dv_polar_f          = 2.000000,   # 6.0 deg/row
             dlat_dv_polar_g          = 0.557594,   # 1.6728 deg/row, just below |mean_g|
-            v_width_f                = d2r(30.0),
-            v_width_g                = d2r(30.0),
+            v_width_f                = d2r(50.0),
+            v_width_g                = d2r(20.0),
         )
     elif formulation == "cubic":
         fg = FGCubic(
@@ -2107,6 +2107,102 @@ def test_plot_fg_derivatives(output_file: str = None,
         print("Wrote plot: ", output_file)
 
 
+def test_plot_stereographic(output_file: str = None,
+                            formulation: str = "tanh",
+                            stride_j: int = 2,
+                            stride_i: int = 4,
+                            max_radius: float = 2.0,
+                            coastline_resolution: str = "110m",
+                            **grid_kwargs):
+    """
+    Draw the mesh in the north polar stereographic plane it is constructed in,
+    with a coastline on top.
+
+    This is the view the construction is actually designed in, and it shows what
+    the lon/lat and 3-D plots cannot:
+
+    - the J-curves are literally circles here, so "strictly embedded" is visible
+      as circles nesting without touching;
+    - the I-curves meet them at right angles on the page, because the projection
+      is conformal -- so orthogonality can be checked by eye;
+    - the origin is the GEOGRAPHIC north pole and the unit circle is the equator,
+      so the offset between the origin and the point where the mesh meridians
+      converge IS the pole displacement, drawn to scale.
+
+    max_radius bounds the view: radius = tan(pi/4 - lat/2), so 1 is the equator
+    and 2 is about 37 S. The southern rows run to radius ~76 at 88.5 S, which is
+    why the plot has to be clipped rather than showing the whole mesh.
+
+    Coastlines come from the Natural Earth data cartopy caches locally.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    import cartopy.io.shapereader as shpreader
+
+    grid = build_example_grid(formulation=formulation, **grid_kwargs)
+    mesh = grid.generate_mesh()
+
+    lon = mesh.corner_lon[:, :, 0]
+    lat = mesh.corner_lat[:, :, 0]
+    x, y = spherical_to_stereo(lon, lat)
+
+    fig, ax = plt.subplots(figsize=(8.5, 8.5))
+
+    # coastline, projected into the same plane and split where it leaves the view
+    path = shpreader.natural_earth(resolution=coastline_resolution,
+                                   category="physical", name="coastline")
+    for geom in shpreader.Reader(path).geometries():
+        for line in (geom.geoms if hasattr(geom, "geoms") else [geom]):
+            c = np.asarray(line.coords)
+            cx, cy = spherical_to_stereo(np.deg2rad(c[:, 0]), np.deg2rad(c[:, 1]))
+            inside = np.hypot(cx, cy) <= max_radius
+            if not inside.any():
+                continue
+            # break the polyline wherever it leaves the clip, so no false chords
+            breaks = np.where(np.diff(inside.astype(int)) != 0)[0] + 1
+            for seg_x, seg_y, seg_in in zip(np.split(cx, breaks),
+                                            np.split(cy, breaks),
+                                            np.split(inside, breaks)):
+                if seg_in.all() and seg_x.size > 1:
+                    ax.plot(seg_x, seg_y, color="0.35", lw=0.7, zorder=3)
+
+    for j in range(0, lat.shape[0], stride_j):                 # J-curves
+        ax.plot(np.append(x[j], x[j, 0]), np.append(y[j], y[j, 0]),
+                color="C0", lw=0.5, alpha=0.65, zorder=2)
+    for i in range(0, lat.shape[1], stride_i):                 # I-curves
+        ax.plot(x[:, i], y[:, i], color="C1", lw=0.5, alpha=0.65, zorder=2)
+
+    ax.add_patch(Circle((0, 0), 1.0, fill=False, color="k", lw=1.2,
+                        ls="--", zorder=4))
+    ax.plot(0, 0, "k+", ms=12, mew=1.6, zorder=5)
+    # The mesh pole always sits on the +y axis, i.e. longitude 90 E: g is by
+    # definition the crossing on that side, and the pole is where f meets it.
+    xp, yp = spherical_to_stereo(np.pi/2, grid.fg.displaced_north_pole_lat)
+    ax.plot(xp, yp, "r*", ms=15, zorder=6)
+    ax.annotate("geographic N pole", (0, 0), textcoords="offset points",
+                xytext=(6, 6), fontsize=8)
+    ax.annotate(f"mesh pole "
+                f"({np.rad2deg(grid.fg.displaced_north_pole_lat):.0f}N, 90E)",
+                (xp, yp), textcoords="offset points", xytext=(10, -14),
+                fontsize=8, color="red")
+    ax.annotate("equator", (0, -1.0), textcoords="offset points",
+                xytext=(4, 4), fontsize=8)
+
+    ax.set_aspect("equal")
+    ax.set_xlim(-max_radius, max_radius)
+    ax.set_ylim(-max_radius, max_radius)
+    ax.set_xlabel("stereographic x"); ax.set_ylabel("stereographic y")
+    ax.set_title(f"{type(grid.fg).__name__}: mesh in the stereographic plane "
+                 f"(J blue, I orange)")
+    ax.grid(alpha=0.2)
+
+    if output_file is None:
+        plt.show()
+    else:
+        plt.savefig(output_file, dpi=120, bbox_inches="tight")
+        print("Wrote plot: ", output_file)
+
+
 if __name__ == "__main__":
 
     # Each formulation needs its own equatorial resolution. The locked schemes
@@ -2118,19 +2214,27 @@ if __name__ == "__main__":
         #("cubic",    dict()),
         #("polystep", dict(dlat_in_SH_degree=1.5)),
         #("linear",   dict(dlat_in_SH_degree=1.5)),
-
     ]
 
-    print("Plotting f' and g' for each formulation...")
     for name, kwargs in FORMULATIONS:
+        print(f"--- {name} ---")
+
+        print("  f' and g' ...")
         test_plot_fg_derivatives(output_file=f"figure_fg_derivative_{name}.png",
                                  formulation=name, **kwargs)
 
-    print("Plotting the mesh for FGTanh...")
-    test_plot_grid(formulation="tanh", output_file="figure_grid_tanh.png",
-                   stride_j=4, stride_i=6)
+        # v_min_degree belongs to the derivative plot only
+        mesh_kwargs = {k: v for k, v in kwargs.items() if k != "v_min_degree"}
 
-    print("Writing grid files for FGTanh...")
-    test_output_SCRIP_file(scrip_file="grid_displaced_pole_tanh_SCRIP.nc",
-                           twod_file="grid_displaced_pole_tanh_2D.nc",
-                           formulation="tanh")
+        print("  mesh on the sphere ...")
+        test_plot_grid(output_file=f"figure_grid_{name}.png",
+                       formulation=name, stride_j=4, stride_i=6, **mesh_kwargs)
+
+        print("  mesh in the stereographic plane ...")
+        test_plot_stereographic(output_file=f"figure_stereographic_{name}.png",
+                                formulation=name, **mesh_kwargs)
+
+        print("  grid files ...")
+        test_output_SCRIP_file(scrip_file=f"grid_displaced_pole_{name}_SCRIP.nc",
+                               twod_file=f"grid_displaced_pole_{name}_2D.nc",
+                               formulation=name, **mesh_kwargs)
