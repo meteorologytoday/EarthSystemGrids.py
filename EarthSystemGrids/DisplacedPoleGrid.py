@@ -1,5 +1,7 @@
-import numpy as np
+import abc
 import functools
+
+import numpy as np
 
 def spherical_to_stereo(lon:float, lat:float):
     """
@@ -312,27 +314,215 @@ def dbeta_dv(
     ) / c
 
 
-class DisplacedPoleGrid:
+class FGBase(abc.ABC):
     """
-    Displaced Pole Grid
+    A formulation of the two y-axis crossings f(v) and g(v) of the mesh parallels.
 
-    Reference:
+    The J-curve labelled by the pseudo-latitude v is the circle
 
-      - Madec, G. and M. Imbard (1996), A global ocean mesh to overcome the North
-        Pole singularity. Climate Dynamics 12(6), 381-388.
+        x^2 + y^2 - ( f(v) + g(v) ) y + f(v) g(v) = 0
 
-    Mesh parallels (J curves) are circles in the north polar stereographic plane
+    so a formulation is completely described by f and g and their derivatives.
+    DisplacedPoleGrid consumes nothing else: it never reads a coefficient, a
+    transition latitude, or a boundary condition. Everything below the four
+    abstract methods is the formulation's own business, including how it solves
+    for its coefficients and how it checks them.
 
-        x^2 + y^2 - ( f + g ) y + f g = 0
+    Resolution independence
+    -----------------------
+    Resolutions are given per unit v, never per grid row, so a formulation never
+    sees dv/dj or the row count. The shape is a fixed curve and dv/dj carries the
+    resolution; changing the number of rows must not change this object.
 
-        f = the northern crossing of the y-axis
-        g = the southern crossing of the y-axis
-        centre = ( 0, (f+g)/2 )        radius = (g-f)/2
+    Subclasses must implement f, dfdv, g, dgdv, and may override
+    `_scheme_checks` and `transition_marks`.
+    """
 
-    Pseudo-latitude:    v [deg]
-    Pseudo-longitude:   u [deg]
+    def __init__(self, displaced_north_pole_lat, dlat_dv_equator, v_max=np.pi/2):
+        self.displaced_north_pole_lat = displaced_north_pole_lat
+        self.v_max = v_max
+        _, self.y_NP = spherical_to_stereo(np.pi/2, displaced_north_pole_lat)
+        # At the equator f = -1, so the Jacobian 2/(1+f^2) is exactly 1 and this
+        # reduces to s0 = dlat_dv_equator. Written through the general
+        # conversion anyway, so there is only one code path.
+        self.s0 = self.dlat_dv_to_dwdv(dlat_dv_equator, -1.0)
 
-    ---
+    # ---- the interface DisplacedPoleGrid depends on --------------------------
+
+    @abc.abstractmethod
+    def f(self, v):
+        """Crossing of the J-curve with the -y axis (longitude 270)."""
+
+    @abc.abstractmethod
+    def dfdv(self, v):
+        """df/dv."""
+
+    @abc.abstractmethod
+    def g(self, v):
+        """Crossing of the J-curve with the +y axis (longitude 90)."""
+
+    @abc.abstractmethod
+    def dgdv(self, v):
+        """dg/dv."""
+
+    # ---- shared helpers ------------------------------------------------------
+
+    @staticmethod
+    def dlat_dv_to_dwdv(dlat_dv, w):
+        """
+        Convert a latitude rate into an ordinate rate at crossing value w.
+
+        The stereographic radius is rho = tan(pi/4 - lat/2), so
+        drho/dlat = -(1/2)(1 + rho^2). The sign of w selects the branch: on the
+        f side w < 0 and the result is positive (f increases), on the g side
+        w > 0 and it is negative (g decreases).
+
+        Note this degenerates at w = 0, where the crossing passes over the
+        geographic pole and the folded latitude has a maximum. Evaluate it only
+        at points where the branch is unambiguous.
+        """
+        return -0.5 * dlat_dv * np.sign(w) * (1 + w**2)
+
+    @staticmethod
+    def dlat_dv_to_dfdv(dlat_dv, f):
+        """
+        Latitude rate -> df/dv on the f branch, using the CONTINUED latitude
+        psi_f = pi/2 + 2 arctan(f), which increases monotonically as the
+        crossing travels north over the geographic pole and down the far side.
+
+        Always positive, and smooth through f = 0. Prefer this to
+        `dlat_dv_to_dwdv` whenever the evaluation point may lie past the
+        crossing, where the folded latitude has a maximum and sign(f) flips.
+        """
+        return +0.5 * dlat_dv * (1 + f**2)
+
+    @staticmethod
+    def dlat_dv_to_dgdv(dlat_dv, g):
+        """
+        As above on the g branch, psi_g = pi/2 - 2 arctan(g). Always negative.
+        g stays positive throughout, so this branch never folds.
+        """
+        return -0.5 * dlat_dv * (1 + g**2)
+
+    def transition_marks(self):
+        """
+        [(v, label)] of interesting locations, for diagnostic plots. Lets a plot
+        annotate a formulation without knowing what kind it is. Default: none.
+        """
+        return []
+
+    def _scheme_checks(self):
+        """
+        Extra verification rows specific to this formulation, as tuples
+        (name, measured, expected, kind) with kind in {eq, eq_loose, gt, lt}.
+        Default: none.
+        """
+        return []
+
+    # ---- verification --------------------------------------------------------
+
+    def verify(self, tolerance: float = 1e-9, samples: int = 2001,
+               verbose: bool = True, raise_on_failure: bool = False):
+        """
+        Check that this formulation does what it claims.
+
+        Two groups are tested, and they fail for different reasons:
+
+        1. Boundary conditions. For a formulation that solves a linear system
+           these are outputs of that solve and should hold to machine precision;
+           a failure means the system was assembled wrongly.
+
+        2. Structural properties, which are NOT automatic. Satisfying every
+           boundary condition and still producing an unusable grid is the normal
+           failure mode: f can fold back, the circles can stop being embedded,
+           or the pole can miss its target. These are properties (a)-(e) of
+           Madec and Imbard (1996).
+
+        Only v in [0, v_max] is examined. Anything a formulation does at
+        negative v is its own affair; the southern hemisphere of the grid is a
+        lat-lon patch that does not use f or g.
+
+        Returns True if every check passes.
+        """
+        v = np.linspace(0.0, self.v_max, samples)
+        f_v    = np.array([self.f(vv)    for vv in v])
+        g_v    = np.array([self.g(vv)    for vv in v])
+        dfdv_v = np.array([self.dfdv(vv) for vv in v])
+        dgdv_v = np.array([self.dgdv(vv) for vv in v])
+        radius = (g_v - f_v) / 2.0
+
+        pole_lat = np.rad2deg(np.pi/2 - 2*np.arctan(np.abs((f_v[-1] + g_v[-1])/2.0)))
+
+        checks = [
+            # name                          measured                          expected   kind
+            ("f(0) = -1",                   self.f(0.0),                      -1.0,      "eq"),
+            ("g(0) = +1",                   self.g(0.0),                      +1.0,      "eq"),
+            ("dfdv(0) = s0",                self.dfdv(0.0),                   self.s0,   "eq"),
+            ("dgdv(0) = -s0",               self.dgdv(0.0),                  -self.s0,   "eq"),
+            ("f(v_max) = y_NP",             self.f(self.v_max),               self.y_NP, "eq"),
+            ("g(v_max) = y_NP",             self.g(self.v_max),               self.y_NP, "eq"),
+            ("C1 at equator: f'+g' = 0",    self.dfdv(0.0) + self.dgdv(0.0),   0.0,      "eq"),
+            ("(c) pole closes: f-g = 0",    f_v[-1] - g_v[-1],                 0.0,      "eq"),
+            ("pole latitude [deg]",         pole_lat,
+             np.rad2deg(self.displaced_north_pole_lat),                                  "eq_loose"),
+            ("(b) f strictly increasing",   dfdv_v.min(),                      0.0,      "gt"),
+            ("(b) g strictly decreasing",   dgdv_v.max(),                      0.0,      "lt"),
+            ("(a) radius > 0 for v < v_max", radius[:-1].min(),                0.0,      "gt"),
+        ] + list(self._scheme_checks())
+
+        ok = True
+        rows = []
+        for name, got, want, kind in checks:
+            if kind == "eq":
+                passed = abs(got - want) <= tolerance
+                detail = f"{got:+14.9f}  want {want:+14.9f}  err {abs(got-want):.1e}"
+            elif kind == "eq_loose":
+                passed = abs(got - want) <= 1e-6 * max(1.0, abs(want))
+                detail = f"{got:+14.9f}  want {want:+14.9f}  err {abs(got-want):.1e}"
+            elif kind == "gt":
+                passed = got > 0.0
+                detail = f"min {got:+14.9f}  must be > 0"
+            else:
+                passed = got < 0.0
+                detail = f"max {got:+14.9f}  must be < 0"
+            ok = ok and passed
+            rows.append((passed, name, detail))
+
+        if verbose:
+            print(f"{type(self).__name__}.verify:")
+            for passed, name, detail in rows:
+                print(f"   [{'ok' if passed else 'FAIL'}] {name:30s} {detail}")
+            print(f"   -> {'all checks passed' if ok else 'FAILURES ABOVE'}")
+
+        if raise_on_failure and not ok:
+            failed = [name for passed, name, _ in rows if not passed]
+            raise AssertionError(f"{type(self).__name__}.verify failed: "
+                                 + ", ".join(failed))
+        return ok
+
+
+class FGLogCosh(FGBase):
+    """
+    The formulation of Madec and Imbard (1996): a linear term plus smooth
+    log-cosh ramps, with the coefficients found from a linear system.
+
+        f(v) = -1 + A1 v - W_tropics_f beta_tropics(v) + W_polar_f beta_polar(v)
+        g(v) = +1 - B1 v - W_g beta_g(v)
+
+    where beta is the ramp defined above. The paper builds f' and g' from
+    hyperbolic tangents "so that the grid spacing can be rather easily adjusted
+    to the desired values"; the transition parameters are what buys that local
+    control, and are the price of it relative to a closed-form scheme.
+
+    Boundary conditions
+    -------------------
+        f(0) = -1                    g(0) = +1
+        dfdv(0) = s0                 dgdv(0) = -s0        (C1 across the equator)
+        dfdv(v_polar) = s_polar      g(v_max) = y_NP
+        f(v_max) = y_NP
+
+    Three on g (2 unknowns B1, W_g after g(0) is hardcoded), four on f
+    (3 unknowns A1, W_polar_f, W_tropics_f after f(0) is hardcoded).
 
     # The functions f and g, and how to solve them
 
@@ -410,47 +600,35 @@ class DisplacedPoleGrid:
         df/dv = -1/2 (dlat/dj) sgn(f) (1+f^2) / (dv/dj)
 
     This is a pratical expression because user can specify the grid resolution dlat/dj
-    and obtain df/dv for a particular location. 
-    
+    and obtain df/dv for a particular location.
     """
-   
-    def __init__(
-        self,
-        displaced_north_pole_lat: float, # [rad]
-        v_trans_tropics_f: float,         # [rad]
-        v_trans_width_tropics_f: float,   # [rad]
-        v_trans_polar_f: float,          # [rad]
-        v_trans_width_polar_f: float,    # [rad]
-        v_trans_g: float,                # [rad]
-        v_trans_g_width: float,          # [rad]
-        resolution_equator: float,       # [rad/grid]
-        resolution_polar: float,         # [rad/grid] the resolution of the point speficied by resolution_polar_v
-        resolution_polar_v: float,       # [rad] location of a high latitude point
-        number_of_rows_in_NH: int,
-        latitude_bounds_in_SH,           # An array of latitudes
-        number_of_columns: int,
-    ):
-        self.displaced_north_pole_lat = displaced_north_pole_lat 
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 dlat_dv_polar,                 # [rad lat / rad v] at v_polar
+                 v_polar,                       # [rad] where dlat_dv_polar applies
+                 v_trans_tropics_f,             # [rad]
+                 v_trans_width_tropics_f,       # [rad]
+                 v_trans_polar_f,               # [rad]
+                 v_trans_width_polar_f,         # [rad]
+                 v_trans_g,                     # [rad]
+                 v_trans_g_width,               # [rad]
+                 v_max=np.pi/2):
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, v_max)
+        self.dlat_dv_polar = dlat_dv_polar
+        self.v_polar = v_polar
         self.v_trans_tropics_f = v_trans_tropics_f
         self.v_trans_width_tropics_f = v_trans_width_tropics_f
         self.v_trans_polar_f = v_trans_polar_f
         self.v_trans_width_polar_f = v_trans_width_polar_f
         self.v_trans_g = v_trans_g
         self.v_trans_g_width = v_trans_g_width
-        self.resolution_equator = resolution_equator
-        self.resolution_polar = resolution_polar
-        self.resolution_polar_v = resolution_polar_v
-        self.number_of_rows_in_NH = number_of_rows_in_NH
-        self.latitude_bounds_in_SH = np.asarray(latitude_bounds_in_SH, dtype=float)
-        self.number_of_columns = number_of_columns
 
-        # The northern branch is the only part parameterised by v, and it spans
-        # the equator to the mesh pole, v in [0, pi/2]. The southern hemisphere
-        # is a plain lat-lon patch placed directly by latitude_bounds_in_SH.
-        self.v_bounds = np.linspace(0.0, np.pi/2, number_of_rows_in_NH + 1)
-        self.dvdj = (np.pi/2) / number_of_rows_in_NH
-    
-        self.solve_for_coefficients()
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
 
     def f(self, v):
         return -1.0 + self.A1 * v + (
@@ -463,10 +641,6 @@ class DisplacedPoleGrid:
             - self.W_tropics_f * dbeta_dv(v, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
             + self.W_polar_f * dbeta_dv(v, self.v_trans_polar_f, self.v_trans_width_polar_f)
         )
-
-    def dfdj(self, j):
-        v = self.v_bounds[j]
-        return self.dfdv(v) * self.dvdj(j)
 
     def g(self, v):
         if v < 0:
@@ -484,188 +658,229 @@ class DisplacedPoleGrid:
                 self.W_g * dbeta_dv(v, self.v_trans_g, self.v_trans_g_width)
             )
 
-    def grid_resolution_to_dgdv(
-        self,
-        grid_resolution: float, # [rad/grid]
-        g: float,               # dimensionless
-    ):
-        
-        return -0.5 * grid_resolution * np.sign(g) * (1 + g**2) / self.dvdj
-
-    def grid_resolution_to_dfdv(
-        self,
-        grid_resolution: float, # [rad/grid]
-        f: float,               # dimensionless
-    ):
-        # The way they are computed are identical        
-        return self.grid_resolution_to_dgdv(grid_resolution, f)
-
-
-    def solve_for_coefficients(self):
- 
-        _, y_NP   = spherical_to_stereo(np.pi/2, self.displaced_north_pole_lat)
-       
-        v_star = - np.abs(self.resolution_polar_v)
-        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
-       
-        s0    = self.grid_resolution_to_dfdv(self.resolution_equator, f=-1.0)
-        s_star = self.grid_resolution_to_dfdv(self.resolution_polar, f=y_star)
-
-        
-        # Solve for g's coefficients first
-        dbetadv_g = dbeta_dv(0.0, self.v_trans_g, self.v_trans_g_width)
-        beta_g = beta(np.pi/2, self.v_trans_g, self.v_trans_g_width)
-        x = np.linalg.solve(
-            np.array([
-                [1,       dbetadv_g],
-                [np.pi/2, beta_g]
-            ]),
-            np.array([
-                s0,
-                1 - y_NP,
-            ])
-        )
-
-        self.B1 = x[0]
-        self.W_g = x[1]
-
-        # Then solve for f
-        dbetadv_polar_f_0     = dbeta_dv(0.0,        self.v_trans_polar_f, self.v_trans_width_polar_f)
-        dbetadv_polar_f_v_star = dbeta_dv(v_star, self.v_trans_polar_f, self.v_trans_width_polar_f)
-        dbetadv_tropics_f_0      = dbeta_dv(0.0,        self.v_trans_tropics_f, self.v_trans_width_tropics_f)
-        dbetadv_tropics_f_v_star = dbeta_dv(v_star, self.v_trans_tropics_f, self.v_trans_width_tropics_f)
-        
-        beta_polar_f_NP    = beta(np.pi/2,    self.v_trans_polar_f, self.v_trans_width_polar_f)
-        beta_tropics_f_NP  = beta(np.pi/2,    self.v_trans_tropics_f, self.v_trans_width_tropics_f)
-        
-        x = np.linalg.solve(
-            np.array([
-                [1,       dbetadv_polar_f_0,       - dbetadv_tropics_f_0    ],
-                [1,       dbetadv_polar_f_v_star,  - dbetadv_tropics_f_v_star],
-                [np.pi/2, beta_polar_f_NP,         - beta_tropics_f_NP   ],
-            ]),
-            np.array([
-                s0,
-                s_star,
-                1 + y_NP,
-            ])
-        )
-
-        self.A1          = x[0]
-        self.W_polar_f   = x[1]
-        self.W_tropics_f = x[2]
-
-        self.verify_coefficients()
-        
-    def verify_coefficients(self, tolerance: float = 1e-9, samples: int = 2001,
-                            verbose: bool = True, raise_on_failure: bool = False):
-        """
-        Check that the solved coefficients do what they were solved for.
-
-        Two separate things are tested:
-
-        1. The seven boundary conditions imposed by solve_for_coefficients().
-           These are the output of a linear solve, so they should hold to
-           machine precision; a failure here means the system was assembled
-           wrongly (a beta where a dbeta_dv belongs, a sign, a stale name).
-
-        2. The structural properties those conditions are supposed to buy,
-           which are NOT automatic. Satisfying all seven and still producing an
-           unusable grid is the normal failure mode: f can fold back, the
-           circles can stop being embedded, or the pole can miss its target.
-           These correspond to properties (a)-(e) of Madec and Imbard (1996).
-
-        Only the northern branch, v in [0, pi/2], is examined. The southern
-        hemisphere is a lat-lon patch placed by latitude_bounds_in_SH and does
-        not use f or g.
-
-        Parameters
-        ----------
-        tolerance        : absolute tolerance for the boundary conditions.
-        samples          : how densely to sample v when testing monotonicity.
-        verbose          : print a table of every check.
-        raise_on_failure : raise AssertionError instead of returning False.
-
-        Returns
-        -------
-        True if every check passes.
-        """
-        _, y_NP = spherical_to_stereo(np.pi/2, self.displaced_north_pole_lat)
-        v_star  = -np.abs(self.resolution_polar_v)
-        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
-        s0     = self.grid_resolution_to_dfdv(self.resolution_equator, f=-1.0)
-        s_star = self.grid_resolution_to_dfdv(self.resolution_polar, f=y_star)
-
-        v = np.linspace(0.0, np.pi/2, samples)
-        f_v    = np.array([self.f(vv)    for vv in v])
-        g_v    = np.array([self.g(vv)    for vv in v])
-        dfdv_v = np.array([self.dfdv(vv) for vv in v])
-        dgdv_v = np.array([self.dgdv(vv) for vv in v])
-        radius = (g_v - f_v) / 2.0
-
-        # latitude the mesh pole actually lands on, and the spacing actually
-        # delivered at the equator, both in degrees
-        pole_lat = np.rad2deg(np.pi/2 - 2*np.arctan(np.abs((f_v[-1] + g_v[-1])/2.0)))
-        eq_spacing = np.rad2deg(abs(dgdv_v[0]) * self.dvdj * 2.0/(1.0 + g_v[0]**2))
-
-        checks = [
-            # name                         measured            expected        kind
-            ("(a) radius > 0 for v < pi/2", radius[:-1].min(), 0.0,            "gt"),
-            ("(b) f strictly increasing",  dfdv_v.min(),       0.0,            "gt"),
-            ("(b) g strictly decreasing",  dgdv_v.max(),       0.0,            "lt"),
-            ("(c) pole closes: f-g = 0",   f_v[-1] - g_v[-1],  0.0,            "eq"),
-            ("(1) f(0) = -1",              self.f(0.0),        -1.0,           "eq"),
-            ("(2) g(0) = +1",              self.g(0.0),        1.0,            "eq"),
-            ("(3) dfdv(0) = s0",           self.dfdv(0.0),     s0,             "eq"),
-            ("(4) dgdv(0) = -s0",          self.dgdv(0.0),     -s0,            "eq"),
-            ("(5) f(pi/2) = y_NP",         self.f(np.pi/2),    y_NP,           "eq"),
-            ("(6) g(pi/2) = y_NP",         self.g(np.pi/2),    y_NP,           "eq"),
-
-            ("(r2) dfdv(v_star) = s_star", self.dfdv(v_star),  s_star,         "eq"),
-            ("C1 at equator: f'+g' = 0",   self.dfdv(0.0) + self.dgdv(0.0), 0.0, "eq"),
-            ("pole latitude [deg]",        pole_lat,
-             np.rad2deg(self.displaced_north_pole_lat),                        "eq_loose"),
-            ("equator spacing [deg/row]",  eq_spacing,
-             np.rad2deg(self.resolution_equator),                              "eq_loose"),
-            ("Design: W_polar_f   > 0",    self.W_polar_f,     0.0,            "gt"),
-            ("Design: W_tropics_f > 0",    self.W_tropics_f,     0.0,            "gt"),
-            ("Design: W_g         > 0",    self.W_g,     0.0,            "gt"),
+    def transition_marks(self):
+        return [
+            (self.v_trans_tropics_f, "v_trans_tropics_f"),
+            (self.v_trans_polar_f,   "v_trans_polar_f"),
+            (self.v_trans_g,         "v_trans_g"),
+            (self.v_polar,           "v_polar"),
         ]
 
-        ok = True
+    def _solve(self):
+        v_star = -np.abs(self.v_polar)
+        _, y_star = spherical_to_stereo(-np.pi/2, v_star)
+
+        s0     = self.s0
+        s_star = self.dlat_dv_to_dwdv(self.dlat_dv_polar, y_star)
+        self._s_star = s_star
+        self._v_star = v_star
+
+        # g: 2 unknowns from dgdv(0) = -s0 and g(v_max) = y_NP
+        self.B1, self.W_g = np.linalg.solve(
+            np.array([
+                [1,          dbeta_dv(0.0, self.v_trans_g, self.v_trans_g_width)],
+                [self.v_max, beta(self.v_max, self.v_trans_g, self.v_trans_g_width)],
+            ]),
+            np.array([s0, 1 - self.y_NP]),
+        )
+
+        # f: 3 unknowns from dfdv(0) = s0, dfdv(v_star) = s_star, f(v_max) = y_NP.
+        # The third is a VALUE condition, so its amplitude entries are beta, not
+        # dbeta_dv -- the single easiest thing to get wrong here.
+        tt, wt = self.v_trans_tropics_f, self.v_trans_width_tropics_f
+        tp, wp = self.v_trans_polar_f,   self.v_trans_width_polar_f
+        self.A1, self.W_polar_f, self.W_tropics_f = np.linalg.solve(
+            np.array([
+                [1,          dbeta_dv(0.0,       tp, wp), -dbeta_dv(0.0,       tt, wt)],
+                [1,          dbeta_dv(v_star,    tp, wp), -dbeta_dv(v_star,    tt, wt)],
+                [self.v_max, beta(self.v_max,    tp, wp), -beta(self.v_max,    tt, wt)],
+            ]),
+            np.array([s0, s_star, 1 + self.y_NP]),
+        )
+
+    def _scheme_checks(self):
+        return [
+            ("dfdv(v_polar) = s_polar", self.dfdv(self._v_star), self._s_star, "eq"),
+            ("design: W_polar_f   > 0", self.W_polar_f,          0.0,          "gt"),
+            ("design: W_tropics_f > 0", self.W_tropics_f,        0.0,          "gt"),
+            ("design: W_g         > 0", self.W_g,                0.0,          "gt"),
+        ]
+
+
+class FGCubic(FGBase):
+    """
+    Cubic Hermite formulation: f and g are the unique cubics matching a value
+    and a slope at each end of [0, v_max].
+
+        f(v) = c0 + c1 v + c2 v^2 + c3 v^3
+
+    Four coefficients, four conditions, and the interpolant is available in
+    closed form, so this scheme has no solver at all -- `_solve` is a few lines
+    of arithmetic rather than two linear systems. There are also no transition
+    parameters to choose.
+
+    Boundary conditions
+    -------------------
+        f(0) = -1,  dfdv(0) = +s0        g(0) = +1,  dgdv(0) = -s0
+        f(v_max) = y_NP,  dfdv(v_max)    g(v_max) = y_NP,  dgdv(v_max)
+
+    Two properties this buys over a scheme with mismatched bases:
+
+    - g gets a fourth condition, so its polar slope is specifiable. In the
+      log-cosh scheme g has only three parameters and dgdv(v_max) is whatever
+      falls out.
+    - because f and g are drawn from the SAME basis, mirrored boundary data
+      give exactly mirrored polynomials. Setting the mesh pole to 90 N with
+      mirrored polar slopes therefore yields g = -f identically, i.e. concentric
+      circles and a plain lat-lon grid, to the last bit.
+
+    What it gives up is local control. The log-cosh ramps let the paper place a
+    knee at a chosen latitude; a cubic is pinned only at its ends, and whatever
+    happens in between is forced by the endpoint data. Note that the mid-range
+    excursion is largely geometry rather than basis: f must cover the whole
+    continued-latitude span between its endpoints, so if both ends are held
+    below the mean rate the middle has to exceed it.
+    """
+
+    def __init__(self,
+                 displaced_north_pole_lat,      # [rad]
+                 dlat_dv_equator,               # [rad lat / rad v]
+                 dlat_dv_polar_f,               # [rad lat / rad v] at v_max, f branch
+                 dlat_dv_polar_g,               # [rad lat / rad v] at v_max, g branch
+                 v_max=np.pi/2):
+        super().__init__(displaced_north_pole_lat, dlat_dv_equator, v_max)
+        self.dlat_dv_polar_f = dlat_dv_polar_f
+        self.dlat_dv_polar_g = dlat_dv_polar_g
+        self._solve()
+        if not self.verify(verbose=False):
+            print(f"{type(self).__name__}: verify() reported failures; "
+                  f"call verify() for the detail.")
+
+    @staticmethod
+    def _hermite(y0, m0, y1, m1, L):
+        """Cubic Hermite on [0, L] in monomial form, c0 + c1 v + c2 v^2 + c3 v^3."""
+        D = (y1 - y0) / L
+        return np.array([y0, m0, (3*D - 2*m0 - m1)/L, (m0 + m1 - 2*D)/L**2])
+
+    def _solve(self):
+        # The f endpoint sits at y_NP > 0, i.e. PAST the zero crossing where the
+        # -y crossing has gone over the geographic pole. The folded-latitude
+        # Jacobian flips sign there, so use the continued-latitude form.
+        m1_f = self.dlat_dv_to_dfdv(self.dlat_dv_polar_f, self.y_NP)
+        m1_g = self.dlat_dv_to_dgdv(self.dlat_dv_polar_g, self.y_NP)
+
+        self.cf = self._hermite(-1.0,  self.s0, self.y_NP, m1_f, self.v_max)
+        self.cg = self._hermite(+1.0, -self.s0, self.y_NP, m1_g, self.v_max)
+
+    @staticmethod
+    def _poly(c, v):
+        return c[0] + c[1]*v + c[2]*v**2 + c[3]*v**3
+
+    @staticmethod
+    def _dpoly(c, v):
+        return c[1] + 2*c[2]*v + 3*c[3]*v**2
+
+    def f(self, v):
+        return self._poly(self.cf, v)
+
+    def dfdv(self, v):
+        return self._dpoly(self.cf, v)
+
+    def g(self, v):
+        if v < 0:
+            return - self.f(v)
+        return self._poly(self.cg, v)
+
+    def dgdv(self, v):
+        if v < 0:
+            return - self.dfdv(v)
+        return self._dpoly(self.cg, v)
+
+    @staticmethod
+    def _monotone_margin(alpha, beta):
+        """
+        Exact monotonicity test for a cubic Hermite (Fritsch and Carlson, 1980),
+        in terms of the endpoint slopes scaled by the secant, alpha = m0/D and
+        beta = m1/D. Returns a value that is positive exactly when the
+        interpolant is monotone.
+
+        The familiar alpha^2 + beta^2 <= 9 disk is only a SUFFICIENT condition --
+        an inscribed approximation of the true region -- so testing against it
+        reports failures for interpolants that are perfectly monotone. The full
+        region is the union of three half-planes and one curved piece.
+        """
+        if alpha < 0.0 or beta < 0.0:
+            return min(alpha, beta)
+        if (alpha + beta - 2.0 <= 0.0
+                or alpha + 2.0*beta - 3.0 <= 0.0
+                or 2.0*alpha + beta - 3.0 <= 0.0):
+            return 1.0                      # inside the half-plane part; any +ve means monotone
+        return alpha - (2.0*alpha + beta - 3.0)**2 / (3.0*(alpha + beta - 2.0))
+
+    def _scheme_checks(self):
+        """
+        Monotonicity established a priori from the endpoint data, rather than by
+        sampling as the base class does. For a cubic this is exact and costs
+        nothing, which is one of the quieter advantages of a closed-form scheme.
+        """
         rows = []
-        for name, got, want, kind in checks:
-            if kind == "eq":
-                passed = abs(got - want) <= tolerance
-                detail = f"{got:+14.9f}  want {want:+14.9f}  err {abs(got-want):.1e}"
-            elif kind == "eq_loose":
-                passed = abs(got - want) <= 1e-6 * max(1.0, abs(want))
-                detail = f"{got:+14.9f}  want {want:+14.9f}  err {abs(got-want):.1e}"
-            elif kind == "gt":
-                passed = got > 0.0
-                detail = f"min {got:+14.9f}  must be > 0"
-            else:
-                passed = got < 0.0
-                detail = f"max {got:+14.9f}  must be < 0"
-            ok = ok and passed
-            rows.append((passed, name, detail))
+        for name, c, y0, y1 in [("f", self.cf, -1.0, self.y_NP),
+                                ("g", self.cg, +1.0, self.y_NP)]:
+            D = (y1 - y0) / self.v_max
+            a = self._dpoly(c, 0.0) / D
+            b = self._dpoly(c, self.v_max) / D
+            rows.append((f"{name}: monotone a priori", self._monotone_margin(a, b), 0.0, "gt"))
+        return rows
 
-        if verbose:
-            print("verify_coefficients:")
-            for passed, name, detail in rows:
-                print(f"   [{'ok' if passed else 'FAIL'}] {name:30s} {detail}")
-            print(f"   -> {'all checks passed' if ok else 'FAILURES ABOVE'}")
-            if ok:
-                print(f"   note: the dfdv(v_star) condition shapes f at v = "
-                      f"{np.rad2deg(v_star):.1f} deg, which the mesh no longer "
-                      f"uses;\n         with the lat-lon southern patch it is a "
-                      f"shape knob, not a resolution.")
 
-        if raise_on_failure and not ok:
-            failed = [name for passed, name, _ in rows if not passed]
-            raise AssertionError("verify_coefficients failed: " + ", ".join(failed))
+class DisplacedPoleGrid:
+    """
+    Displaced Pole Grid
 
-        return ok
+    Reference:
+
+      - Madec, G. and M. Imbard (1996), A global ocean mesh to overcome the North
+        Pole singularity. Climate Dynamics 12(6), 381-388.
+
+    Mesh parallels (J curves) are circles in the north polar stereographic plane
+
+        x^2 + y^2 - ( f + g ) y + f g = 0
+
+        f = the northern crossing of the y-axis
+        g = the southern crossing of the y-axis
+        centre = ( 0, (f+g)/2 )        radius = (g-f)/2
+
+    Pseudo-latitude:    v [deg]
+    Pseudo-longitude:   u [deg]
+
+    ---
+
+    The formulation of f and g lives in a separate object (see `FGBase`), so a
+    grid can be built from any scheme that provides f, dfdv, g and dgdv. This
+    class asks for nothing else: no coefficient, no transition latitude, no
+    boundary condition.
+
+    The southern hemisphere is a plain lat-lon patch placed directly by
+    `latitude_bounds_in_SH`, and does not use f or g at all. Only the northern
+    branch, v in [0, pi/2], is parameterised by v.
+    """
+   
+    def __init__(
+        self,
+        fg: FGBase,                      # the f/g formulation
+        number_of_rows_in_NH: int,
+        latitude_bounds_in_SH,           # An array of latitudes [rad], ascending, ending at 0
+        number_of_columns: int,
+    ):
+        self.fg = fg
+        self.number_of_rows_in_NH = number_of_rows_in_NH
+        self.latitude_bounds_in_SH = np.asarray(latitude_bounds_in_SH, dtype=float)
+        self.number_of_columns = number_of_columns
+
+        # v parameterises only the northern branch, equator to mesh pole. dv/dj
+        # carries the resolution and `fg` never sees it, which is what keeps the
+        # formulation independent of how finely the grid is discretised.
+        self.dvdj = (np.pi/2) / number_of_rows_in_NH
 
     def generate_J_curve(
         self,
@@ -681,8 +896,8 @@ class DisplacedPoleGrid:
 
         if v >= 0:
 
-            f = self.f(v)
-            g = self.g(v)
+            f = self.fg.f(v)
+            g = self.fg.g(v)
 
             r   = (g - f) / 2.0
             y_c = (g + f) / 2.0
@@ -711,7 +926,7 @@ class DisplacedPoleGrid:
         Compute the I curve (mesh zonal circle) given the mesh longitude u.
         """
 
-        _I_curve_ray_tracing_system = functools.partial(I_curve_ray_tracing_system, FG_funcs=self)
+        _I_curve_ray_tracing_system = functools.partial(I_curve_ray_tracing_system, FG_funcs=self.fg)
 
         # initial point: on the equator
         x0 = np.cos(u)
@@ -812,7 +1027,7 @@ class DisplacedPoleGrid:
         print(f"dv_doubled = {dv_doubled}")
         n_steps_N = v_all.size - 1
 
-        I_curve_generator = functools.partial(I_curve_ray_tracing_system, FG_funcs=self)
+        I_curve_generator = functools.partial(I_curve_ray_tracing_system, FG_funcs=self.fg)
 
         n_rows_doubled = (2*nj_S + 1) + (2*nj_N)
         x = np.zeros((n_rows_doubled, 2*ni))
@@ -1054,7 +1269,8 @@ def write_to_2D_grid_file(mesh: DisplacedPoleMesh, output_file):
 def build_example_grid(number_of_rows_in_NH: int = 30,
                        number_of_columns: int = 120,
                        dlat_in_SH_degree: float = 3.0,
-                       southern_edge_degree: float = -90.0):
+                       southern_edge_degree: float = -90.0,
+                       formulation: str = "logcosh"):
     """
     A worked example: mesh pole over China at 40 N / 90 E, tropical refinement,
     and a plain lat-lon southern patch.
@@ -1062,19 +1278,44 @@ def build_example_grid(number_of_rows_in_NH: int = 30,
     dlat_in_SH_degree is also used as the equatorial meridional resolution, so
     that e2 is continuous across the equator. That is the one condition the
     southern patch has to respect; see the note in generate_mesh.
+
+    Note the unit conversion. An FG formulation takes resolutions per unit v,
+    not per grid row, so that it stays independent of how finely the grid is
+    discretised. Rows enter only through dv/dj, which belongs to the grid:
+
+        dlat/dv = (dlat/dj) / (dv/dj),    dv/dj = (pi/2) / number_of_rows_in_NH
+
+    `formulation` selects which scheme builds f and g; both produce the same
+    kind of object and DisplacedPoleGrid cannot tell them apart.
     """
     d2r = np.deg2rad
+    dvdj = (np.pi/2) / number_of_rows_in_NH
+
+    if formulation == "logcosh":
+        fg = FGLogCosh(
+            displaced_north_pole_lat = d2r(40.0),   # mesh north pole latitude
+            dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
+            dlat_dv_polar            = d2r(0.01) / dvdj,
+            v_polar                  = d2r(-85.0),
+            v_trans_tropics_f        = d2r(20.0),   # tropical refinement knee, f
+            v_trans_width_tropics_f  = d2r(10.0),
+            v_trans_polar_f          = d2r(70.0),   # polar knee, f
+            v_trans_width_polar_f    = d2r(10.0),
+            v_trans_g                = d2r(30.0),   # polar knee, g
+            v_trans_g_width          = d2r(10.0),
+        )
+    elif formulation == "cubic":
+        fg = FGCubic(
+            displaced_north_pole_lat = d2r(40.0),
+            dlat_dv_equator          = d2r(dlat_in_SH_degree) / dvdj,
+            dlat_dv_polar_f          = d2r(dlat_in_SH_degree) / dvdj,
+            dlat_dv_polar_g          = d2r(dlat_in_SH_degree) / dvdj,
+        )
+    else:
+        raise ValueError(f"unknown formulation {formulation!r}")
+
     return DisplacedPoleGrid(
-        displaced_north_pole_lat = d2r(40.0),   # mesh north pole latitude
-        v_trans_tropics_f        = d2r(20.0),   # tropical refinement knee, f
-        v_trans_width_tropics_f  = d2r(10.0),
-        v_trans_polar_f          = d2r(70.0),   # polar knee, f
-        v_trans_width_polar_f    = d2r(10.0),
-        v_trans_g                = d2r(30.0),   # polar knee, g
-        v_trans_g_width          = d2r(10.0),
-        resolution_equator       = d2r(dlat_in_SH_degree),
-        resolution_polar         = d2r(0.01),
-        resolution_polar_v       = d2r(-85),
+        fg                       = fg,
         number_of_rows_in_NH     = number_of_rows_in_NH,
         # stop short of -90: there all meridians converge and e1 -> 0, the
         # ordinary lat-lon pole singularity. Antarctica covers the remainder.
@@ -1092,9 +1333,7 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
     """
     print("Generating grid...")
     grid = build_example_grid()
-    print(f"  A1 = {grid.A1:+.6f}   W_polar_f = {grid.W_polar_f:+.6f}   "
-          f"W_tropics_f = {grid.W_tropics_f:+.6f}")
-    print(f"  B1 = {grid.B1:+.6f}   W_g = {grid.W_g:+.6f}")
+    print(f"  formulation: {type(grid.fg).__name__}")
 
     print("Assembling mesh...")
     mesh = grid.generate_mesh()
@@ -1180,28 +1419,31 @@ def test_plot_fg_derivatives(output_file: str = None):
 
     Two panels, because the two quantities answer different questions:
 
-    - top: the raw shape derivatives. These are what solve_for_coefficients()
-      pins, so the boundary conditions are directly readable off the axes.
+    - top: the raw shape derivatives. These are what the formulation's boundary
+      conditions pin, so they are directly readable off the axes.
     - bottom: the same information converted to meridional grid spacing in
       degrees per row, via dlat/dj = |d/dv| * 2/(1 + w^2) * dv/dj. That factor
       is not close to 1 away from the equator, so the two panels do not have
       the same shape, and the bottom one is the one to judge resolution by.
 
-    v < 0 is shaded: f and g are still defined there and the dfdv(v_star)
-    condition still acts there, but the mesh no longer uses them, since the
-    southern hemisphere is the lat-lon patch.
+    v < 0 is shaded: a formulation may still be defined there, and a boundary
+    condition may still act there, but the mesh does not use it -- the southern
+    hemisphere is the lat-lon patch.
+
+    Formulation-agnostic: it reads only grid.fg's four methods, s0, and
+    transition_marks(), so it works for any FGBase subclass.
     """
     import matplotlib.pyplot as plt
 
     grid = build_example_grid()
+    fg = grid.fg
     r2d = np.rad2deg
 
-    v_star = -np.abs(grid.resolution_polar_v)
     v = np.linspace(-np.pi/2, np.pi/2, 1201)
-    dfdv = np.array([grid.dfdv(vv) for vv in v])
-    dgdv = np.array([grid.dgdv(vv) for vv in v])
-    f_v  = np.array([grid.f(vv) for vv in v])
-    g_v  = np.array([grid.g(vv) for vv in v])
+    dfdv = np.array([fg.dfdv(vv) for vv in v])
+    dgdv = np.array([fg.dgdv(vv) for vv in v])
+    f_v  = np.array([fg.f(vv) for vv in v])
+    g_v  = np.array([fg.g(vv) for vv in v])
 
     # ordinate rate -> meridional spacing in degrees per row
     to_deg_per_row = lambda d, w: r2d(np.abs(d) * 2.0/(1.0 + w**2) * grid.dvdj)
@@ -1212,7 +1454,7 @@ def test_plot_fg_derivatives(output_file: str = None):
     ax.plot(r2d(v), dfdv, label="df/dv", lw=1.6)
     ax.plot(r2d(v), dgdv, label="dg/dv", lw=1.6)
     ax.axhline(0.0, color="0.7", lw=0.8)
-    s0 = grid.grid_resolution_to_dfdv(grid.resolution_equator, f=-1.0)
+    s0 = fg.s0
     ax.plot([0, 0], [s0, -s0], "k.", ms=8, zorder=5)
     ax.annotate(f"  f'(0) = +s0 = {s0:.4f}", (0, s0), fontsize=8, va="bottom")
     ax.annotate(f"  g'(0) = -s0", (0, -s0), fontsize=8, va="top")
@@ -1223,8 +1465,8 @@ def test_plot_fg_derivatives(output_file: str = None):
     ax = axes[1]
     ax.plot(r2d(v), to_deg_per_row(dfdv, f_v), label="f branch (lon 270 / 90)", lw=1.6)
     ax.plot(r2d(v), to_deg_per_row(dgdv, g_v), label="g branch (lon 90)", lw=1.6)
-    ax.axhline(r2d(grid.resolution_equator), color="0.5", ls=":", lw=1.0,
-               label="resolution_equator")
+    ax.axhline(r2d(fg.s0 * grid.dvdj), color="0.5", ls=":", lw=1.0,
+               label="equatorial resolution")
     ax.set_ylabel("meridional spacing  [deg / row]")
     ax.set_xlabel("v  [deg]")
     ax.set_title("Same thing as grid resolution (paper Fig. 2)")
@@ -1234,16 +1476,14 @@ def test_plot_fg_derivatives(output_file: str = None):
         ax.axvspan(r2d(v[0]), 0.0, color="0.9", zorder=0)
         ax.annotate("not used by the mesh\n(lat-lon patch)", (r2d(v[0]) * 0.95, ax.get_ylim()[1]),
                     fontsize=7, color="0.4", va="top")
-        for vt, name, colour in [(grid.v_trans_tropics_f, "v_trans_tropics_f", "C0"),
-                                 (grid.v_trans_polar_f,   "v_trans_polar_f",   "C0"),
-                                 (grid.v_trans_g,         "v_trans_g",         "C1")]:
-            ax.axvline(r2d(vt), color=colour, ls="--", lw=0.7, alpha=0.5)
-        ax.axvline(r2d(v_star), color="k", ls="-.", lw=0.7, alpha=0.6)
+        for vt, name in fg.transition_marks():
+            ax.axvline(r2d(vt), color="0.3", ls="--", lw=0.7, alpha=0.5)
         ax.axvline(90.0, color="k", lw=0.8, alpha=0.6)
         ax.grid(alpha=0.25)
 
-    axes[0].annotate("v_star", (r2d(v_star), axes[0].get_ylim()[0]), fontsize=7,
-                     rotation=90, va="bottom", ha="right")
+    for vt, name in fg.transition_marks():
+        axes[0].annotate(name, (r2d(vt), axes[0].get_ylim()[0]), fontsize=6,
+                         rotation=90, va="bottom", ha="right", color="0.3")
     axes[0].annotate("mesh pole", (90.0, axes[0].get_ylim()[0]), fontsize=7,
                      rotation=90, va="bottom", ha="right")
 
