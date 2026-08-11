@@ -1789,7 +1789,7 @@ def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None
     if output_file is None:
         plt.show()
     else:
-        plt.savefig(output_file, dpi=110, bbox_inches="tight")
+        plt.savefig(output_file, dpi=300, bbox_inches="tight")
         print("Wrote plot: ", output_file)
 
 
@@ -1916,7 +1916,7 @@ def test_plot_fg_derivatives(output_file: str = None,
     if output_file is None:
         plt.show()
     else:
-        plt.savefig(output_file, dpi=110, bbox_inches="tight")
+        plt.savefig(output_file, dpi=300, bbox_inches="tight")
         print("Wrote plot: ", output_file)
 
 
@@ -2014,7 +2014,7 @@ def test_plot_stereographic(output_file: str = None,
     if output_file is None:
         plt.show()
     else:
-        plt.savefig(output_file, dpi=120, bbox_inches="tight")
+        plt.savefig(output_file, dpi=300, bbox_inches="tight")
         print("Wrote plot: ", output_file)
 
 
@@ -2035,18 +2035,18 @@ if __name__ == "__main__":
         print(f"--- {name} ---")
 
         print("  f' and g' ...")
-        test_plot_fg_derivatives(output_file=f"figure_fg_derivative_{name}.png",
+        test_plot_fg_derivatives(output_file=f"figure_fg_derivative_{name}.svg",
                                  formulation=name, **kwargs)
 
         # v_min_degree belongs to the derivative plot only
         mesh_kwargs = {k: v for k, v in kwargs.items() if k != "v_min_degree"}
 
         print("  mesh on the sphere ...")
-        test_plot_grid(output_file=f"figure_grid_{name}.png",
+        test_plot_grid(output_file=f"figure_grid_{name}.svg",
                        formulation=name, stride_j=4, stride_i=6, **mesh_kwargs)
 
         print("  mesh in the stereographic plane ...")
-        test_plot_stereographic(output_file=f"figure_stereographic_{name}.png",
+        test_plot_stereographic(output_file=f"figure_stereographic_{name}.svg",
                                 formulation=name, **mesh_kwargs)
 
         print("  grid files ...")
