@@ -4,7 +4,7 @@ import functools
 import numpy as np
 from scipy.optimize import brentq
 
-from EarthSystemGrids.GridMesh import GridMesh, apply_ocean_mask, _R_EARTH
+from EarthSystemGrids.base import StructuredQuadMesh, apply_ocean_mask, _R_EARTH
 
 # The northern branch runs from the equator to the mesh north pole, and the
 # pseudo-latitude v mirrors geographic latitude, so the pole sits at v = pi/2.
@@ -1246,7 +1246,7 @@ class DisplacedPoleGrid:
 
         Returns
         -------
-        GridMesh
+        StructuredQuadMesh
         """
         if latitude_bounds_in_SH is None:
             latitude_bounds_in_SH = self.latitude_bounds_in_SH
@@ -1329,7 +1329,7 @@ class DisplacedPoleGrid:
         area_sr = _spherical_excess(np.moveaxis(corner_lon, 2, 0),
                                     np.moveaxis(corner_lat, 2, 0))
 
-        return GridMesh.from_corners(
+        return StructuredQuadMesh.from_corners(
             corner_lon = corner_lon,
             corner_lat = corner_lat,
             face_lon   = center_lon,
@@ -1394,7 +1394,7 @@ def _spherical_excess(lon, lat):
 
 
 
-def write_to_SCRIP_grid_file(mesh: GridMesh, output_file, flatten: bool = True):
+def write_to_SCRIP_grid_file(mesh: StructuredQuadMesh, output_file, flatten: bool = True):
     """
     Write `mesh` as a SCRIP grid file, readable by ESMF_RegridWeightGen.
 
@@ -1444,7 +1444,7 @@ def write_to_SCRIP_grid_file(mesh: GridMesh, output_file, flatten: bool = True):
     ds.to_netcdf(output_file)
 
 
-def write_to_2D_grid_file(mesh: GridMesh, output_file):
+def write_to_2D_grid_file(mesh: StructuredQuadMesh, output_file):
     """
     Write `mesh` as a plain 2D (j, i) file for quick inspection in ncview.
 
