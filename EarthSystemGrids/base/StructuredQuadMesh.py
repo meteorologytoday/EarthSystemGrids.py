@@ -1,6 +1,9 @@
 import numpy as np
+import xarray as xr
 
-from EarthSystemGrids.base.UnstructuredGridMesh import UnstructuredGridMesh, _great_circle_lengths
+from EarthSystemGrids.base.UnstructuredGridMesh import (
+    UnstructuredGridMesh, _great_circle_lengths, _FACE_ATTRS,
+)
 
 
 class StructuredQuadMesh(UnstructuredGridMesh):
@@ -70,6 +73,33 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         angle_of_rotation_from_east_to_x.
         """
         return _rotation_angle(self.face_lon, self.face_lat, self.shape)
+
+    def extra_variables(self):
+        """
+        Contributes the rotation angle and its cosine/sine to
+        write_to_CF_grid_file. Meaningful only here: they need a logical
+        i-direction to take a centred difference along, which only a
+        structured mesh has.
+        """
+        angle = self.rotation_angle()
+        return {
+            "angle": xr.DataArray(
+                angle, dims=["nface"],
+                attrs={
+                    "standard_name": "angle_of_rotation_from_east_to_x",
+                    "units": "radian",
+                    **_FACE_ATTRS,
+                },
+            ),
+            "cos_angle": xr.DataArray(
+                np.cos(angle), dims=["nface"],
+                attrs={"long_name": "cosine of grid rotation angle", "units": "1", **_FACE_ATTRS},
+            ),
+            "sin_angle": xr.DataArray(
+                np.sin(angle), dims=["nface"],
+                attrs={"long_name": "sine of grid rotation angle", "units": "1", **_FACE_ATTRS},
+            ),
+        }
 
 
 def _build_topology_2d(corner_lon, corner_lat, shape):

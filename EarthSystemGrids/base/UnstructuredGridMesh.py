@@ -6,6 +6,8 @@ import xarray as xr
 
 _R_EARTH     = 6.371e6  # m, spherical Earth
 _FILL_VALUE  = -1       # sentinel for unused face_nodes / face_edges slots
+_FACE_ATTRS  = {"mesh": "mesh", "location": "face"}
+_EDGE_ATTRS  = {"mesh": "mesh", "location": "edge"}
 
 
 class UnstructuredGridMesh:
@@ -88,6 +90,23 @@ class UnstructuredGridMesh:
     def n_nodes_per_face(self):
         """(nface,) int: each face's true corner count, ignoring padding."""
         return np.count_nonzero(self.face_nodes != _FILL_VALUE, axis=1)
+
+    def extra_variables(self):
+        """
+        Hook for subclasses to contribute to write_to_CF_grid_file.
+
+        Called last, after every base CF/UGRID variable has already been
+        added to the output dataset, so a subclass is free to add fields
+        that only it can define (e.g. a rotation angle that needs a
+        logical i-direction) or to replace a base variable outright by
+        returning its name again. UnstructuredGridMesh itself has no
+        subclass-specific fields, so this is empty.
+
+        Returns
+        -------
+        dict of {variable_name: xr.DataArray}
+        """
+        return {}
 
     @classmethod
     def from_polygons(cls, face_corner_lon, face_corner_lat, face_lon, face_lat,
@@ -226,17 +245,12 @@ def write_to_CF_grid_file(mesh: UnstructuredGridMesh, output_file):
     in face_nodes / face_edges are marked with a `_FillValue`, per the
     UGRID convention for meshes that do not have a uniform face arity.
 
-    If `mesh` is a StructuredQuadMesh, the rotation angle
-    (angle_of_rotation_from_east_to_x) and its cosine and sine are computed
-    from face-centre coordinates via a centred difference along the
-    logical i-direction, and written as face-located variables. A general
-    UnstructuredGridMesh has no such i-direction, so these fields are
-    omitted for it.
+    Fields that only some mesh subclasses can define -- e.g. a rotation
+    angle, which needs a logical i-direction -- are not handled here at
+    all. They come from `mesh.extra_variables()`, called once every base
+    variable below has been written; see UnstructuredGridMesh.extra_variables
+    and StructuredQuadMesh.extra_variables.
     """
-    # Deferred import: StructuredQuadMesh depends on this module for its base
-    # class, so importing it at module scope here would be circular.
-    from EarthSystemGrids.base.StructuredQuadMesh import StructuredQuadMesh
-
     rad2deg = 180.0 / np.pi
 
     ds = xr.Dataset()
@@ -291,12 +305,9 @@ def write_to_CF_grid_file(mesh: UnstructuredGridMesh, output_file):
         attrs={"standard_name": "latitude", "units": "degrees_north"},
     )
 
-    _face = {"mesh": "mesh", "location": "face"}
-    _edge = {"mesh": "mesh", "location": "edge"}
-
     ds["cell_area"] = xr.DataArray(
         mesh.area, dims=["nface"],
-        attrs={"standard_name": "cell_area", "units": "m2", **_face},
+        attrs={"standard_name": "cell_area", "units": "m2", **_FACE_ATTRS},
     )
     ds["mask"] = xr.DataArray(
         mesh.mask.astype(np.int32), dims=["nface"],
@@ -305,33 +316,16 @@ def write_to_CF_grid_file(mesh: UnstructuredGridMesh, output_file):
             "units":         "1",
             "flag_values":   np.array([0, 1], dtype=np.int32),
             "flag_meanings": "land ocean",
-            **_face,
+            **_FACE_ATTRS,
         },
     )
 
-    if isinstance(mesh, StructuredQuadMesh):
-        angle = mesh.rotation_angle()
-        ds["angle"] = xr.DataArray(
-            angle, dims=["nface"],
-            attrs={
-                "standard_name": "angle_of_rotation_from_east_to_x",
-                "units": "radian",
-                **_face,
-            },
-        )
-        ds["cos_angle"] = xr.DataArray(
-            np.cos(angle), dims=["nface"],
-            attrs={"long_name": "cosine of grid rotation angle", "units": "1", **_face},
-        )
-        ds["sin_angle"] = xr.DataArray(
-            np.sin(angle), dims=["nface"],
-            attrs={"long_name": "sine of grid rotation angle", "units": "1", **_face},
-        )
-
     ds["edge_length"] = xr.DataArray(
         mesh.edge_length, dims=["nedge"],
-        attrs={"long_name": "edge length", "units": "m", **_edge},
+        attrs={"long_name": "edge length", "units": "m", **_EDGE_ATTRS},
     )
+
+    ds.update(mesh.extra_variables())
 
     ds.attrs = {
         "Conventions": "CF-1.10, UGRID-1.0",
