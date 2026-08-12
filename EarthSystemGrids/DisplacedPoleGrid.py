@@ -4,6 +4,8 @@ import functools
 import numpy as np
 from scipy.optimize import brentq
 
+from EarthSystemGrids.GridMesh import GridMesh, apply_ocean_mask, _R_EARTH
+
 # The northern branch runs from the equator to the mesh north pole, and the
 # pseudo-latitude v mirrors geographic latitude, so the pole sits at v = pi/2.
 # This is structural, not a convention that can be varied: the grid discretises
@@ -1244,7 +1246,7 @@ class DisplacedPoleGrid:
 
         Returns
         -------
-        DisplacedPoleMesh
+        GridMesh
         """
         if latitude_bounds_in_SH is None:
             latitude_bounds_in_SH = self.latitude_bounds_in_SH
@@ -1324,28 +1326,21 @@ class DisplacedPoleGrid:
             corner_lon[:, :, k] = lon[np.ix_(rr, cc)]
             corner_lat[:, :, k] = lat[np.ix_(rr, cc)]
 
-        # scale factors straight off the doubled mesh: the mid-edge points are
-        # already there, so no interpolation or finite differencing is needed.
-        e1 = _great_circle(lon[np.ix_(rows_ctr, cols_edge)],   lat[np.ix_(rows_ctr, cols_edge)],
-                           lon[np.ix_(rows_ctr, cols_edge_1)], lat[np.ix_(rows_ctr, cols_edge_1)],
-                           earth_radius)
-        e2 = _great_circle(lon[np.ix_(rows_edge, cols_ctr)],   lat[np.ix_(rows_edge, cols_ctr)],
-                           lon[np.ix_(rows_edge_1, cols_ctr)], lat[np.ix_(rows_edge_1, cols_ctr)],
-                           earth_radius)
+        area_sr = _spherical_excess(np.moveaxis(corner_lon, 2, 0),
+                                    np.moveaxis(corner_lat, 2, 0))
 
-        area = _spherical_excess(np.moveaxis(corner_lon, 2, 0),
-                                 np.moveaxis(corner_lat, 2, 0))
-
-        return DisplacedPoleMesh(
-            center_lon = center_lon,
-            center_lat = center_lat,
+        return GridMesh.from_corners(
             corner_lon = corner_lon,
             corner_lat = corner_lat,
-            e1 = e1,
-            e2 = e2,
-            area = area,
-            mask = np.ones((nj, ni), dtype=np.int32),
-            number_of_rows_in_SH = nj_S,
+            face_lon   = center_lon,
+            face_lat   = center_lat,
+            area       = area_sr * earth_radius**2,
+            mask       = np.ones((nj, ni), dtype=np.int32),
+            shape      = (nj, ni),
+            attrs      = {
+                "title":                "Displaced pole grid (Madec and Imbard, 1996)",
+                "number_of_rows_in_SH": nj_S,
+            },
         )
 
 
@@ -1361,12 +1356,6 @@ def _unit_vectors(lon, lat):
         np.sin(lat),
     ), axis=0)
 
-
-def _great_circle(lon1, lat1, lon2, lat2, radius: float = 1.0):
-    """Great-circle distance between two points, in the units of `radius`."""
-    a = _unit_vectors(lon1, lat1)
-    b = _unit_vectors(lon2, lat2)
-    return radius * np.arccos(np.clip(np.sum(a * b, axis=0), -1.0, 1.0))
 
 
 def _spherical_excess(lon, lat):
@@ -1404,82 +1393,8 @@ def _spherical_excess(lon, lat):
             + triangle(v[:, 0], v[:, 2], v[:, 3]))
 
 
-class DisplacedPoleMesh:
-    """
-    A concrete set of cells produced by DisplacedPoleGrid.generate_mesh().
 
-    All longitudes and latitudes are in radians. Corners are ordered
-    counter-clockwise starting from the (v_low, u_low) corner, which is the
-    ordering ESMF_RegridWeightGen expects.
-
-    Attributes
-    ----------
-    center_lon, center_lat : (nj, ni)
-    corner_lon, corner_lat : (nj, ni, 4)
-    e1, e2                 : (nj, ni) zonal and meridional scale factors [m]
-    area                   : (nj, ni) solid angle [steradian]
-    mask                   : (nj, ni) int, 1 = active
-    number_of_rows_in_SH   : rows below the equator (the lat-lon patch)
-    """
-
-    def __init__(self, center_lon, center_lat, corner_lon, corner_lat,
-                 e1, e2, area, mask, number_of_rows_in_SH):
-        self.center_lon = center_lon
-        self.center_lat = center_lat
-        self.corner_lon = corner_lon
-        self.corner_lat = corner_lat
-        self.e1 = e1
-        self.e2 = e2
-        self.area = area
-        self.mask = mask
-        self.number_of_rows_in_SH = number_of_rows_in_SH
-
-    @property
-    def shape(self):
-        return self.center_lon.shape
-
-
-def apply_ocean_mask(mesh: DisplacedPoleMesh):
-    """
-    Set mesh.mask from a real coastline: 1 over ocean, 0 over land.
-
-    Uses the `global_land_mask` package, whose data is bundled with it, so this
-    needs no network access. Its grid is 1/4 degree, derived from Natural Earth.
-
-    The test is on the CELL CENTRE, which is the usual convention and what
-    ESMF_RegridWeightGen assumes when it reads grid_imask -- a cell is either
-    wholly in or wholly out. Near a coastline that is a coin flip decided by
-    where the centre happens to fall, so a cell straddling the shore is kept or
-    dropped whole. That is only meaningful while the cells are small compared
-    with the coastline features; this mesh has cells of a few hundred km near
-    the equator, so treat the result as indicative rather than as a model land
-    mask.
-
-    Note the mesh pole sits over land by design -- that is the entire point of
-    the construction -- so the cells around it should mask out, and their being
-    masked is a useful check that the pole landed where it was meant to.
-
-    Modifies mesh in place and returns it.
-    """
-    try:
-        from global_land_mask import globe
-    except ImportError as exc:
-        raise ImportError(
-            "apply_ocean_mask needs the `global_land_mask` package "
-            "(pip install global-land-mask). It bundles its own data, so no "
-            "download is required at run time.") from exc
-
-    lat = np.rad2deg(mesh.center_lat)
-    lon = np.rad2deg(mesh.center_lon)
-    # the package wants lon in [-180, 180) and lat strictly inside the poles
-    lon = (lon + 180.0) % 360.0 - 180.0
-    lat = np.clip(lat, -89.999, 89.999)
-
-    mesh.mask = np.where(globe.is_land(lat, lon), 0, 1).astype(np.int32)
-    return mesh
-
-
-def write_to_SCRIP_grid_file(mesh: DisplacedPoleMesh, output_file, flatten: bool = True):
+def write_to_SCRIP_grid_file(mesh: GridMesh, output_file, flatten: bool = True):
     """
     Write `mesh` as a SCRIP grid file, readable by ESMF_RegridWeightGen.
 
@@ -1491,45 +1406,45 @@ def write_to_SCRIP_grid_file(mesh: DisplacedPoleMesh, output_file, flatten: bool
     import xarray as xr
 
     nj, ni = mesh.shape
-    grid_corners = 4
-
-    # ESMF_RegridWeightGen reads grid_dims in the reverse of the array order.
-    # This is undocumented in the user manual; see also JCMGrid.py.
-    grid_dims = [ni, nj]
+    grid_corners   = mesh.n_corners
+    grid_dims      = [ni, nj]   # ESMF reads in reverse array order; undocumented
     grid_dim_names = ["lat", "lon"]
+    rad2deg        = 180.0 / np.pi
 
-    rad2deg = 180.0 / np.pi
+    corner_lon = mesh.node_lon[mesh.face_nodes]  # (nface, N)
+    corner_lat = mesh.node_lat[mesh.face_nodes]
+    area_sr    = mesh.area / _R_EARTH**2          # m² → steradians for SCRIP
 
     if flatten:
         ds = xr.Dataset(
-            data_vars = dict(
-                grid_dims       = ( ["grid_rank", ], grid_dims),
-                grid_imask      = ( ["grid_size", ], mesh.mask.flatten()),
-                grid_center_lat = ( ["grid_size", ], mesh.center_lat.flatten() * rad2deg, {"units" : "degrees"} ),
-                grid_center_lon = ( ["grid_size", ], mesh.center_lon.flatten() * rad2deg, {"units" : "degrees"} ),
-                grid_corner_lat = ( ["grid_size", "grid_corners"], mesh.corner_lat.reshape((-1, grid_corners)) * rad2deg, {"units" : "degrees"} ),
-                grid_corner_lon = ( ["grid_size", "grid_corners"], mesh.corner_lon.reshape((-1, grid_corners)) * rad2deg, {"units" : "degrees"} ),
-                grid_area       = ( ["grid_size", ], mesh.area.flatten(), {"units" : "radians^2"} ),
+            data_vars=dict(
+                grid_dims       = (["grid_rank"],                  grid_dims),
+                grid_imask      = (["grid_size"],                  mesh.mask),
+                grid_center_lat = (["grid_size"],                  mesh.face_lat * rad2deg, {"units": "degrees"}),
+                grid_center_lon = (["grid_size"],                  mesh.face_lon * rad2deg, {"units": "degrees"}),
+                grid_corner_lat = (["grid_size", "grid_corners"],  corner_lat    * rad2deg, {"units": "degrees"}),
+                grid_corner_lon = (["grid_size", "grid_corners"],  corner_lon    * rad2deg, {"units": "degrees"}),
+                grid_area       = (["grid_size"],                  area_sr,                 {"units": "radians^2"}),
             ),
         )
     else:
         ds = xr.Dataset(
-            data_vars = dict(
-                grid_dims       = ( ["grid_rank", ], grid_dims),
-                grid_imask      = ( [*grid_dim_names], mesh.mask),
-                grid_center_lat = ( [*grid_dim_names], mesh.center_lat, {"units" : "radians"} ),
-                grid_center_lon = ( [*grid_dim_names], mesh.center_lon, {"units" : "radians"} ),
-                grid_corner_lat = ( [*grid_dim_names, "grid_corners"], mesh.corner_lat, {"units" : "radians"} ),
-                grid_corner_lon = ( [*grid_dim_names, "grid_corners"], mesh.corner_lon, {"units" : "radians"} ),
-                grid_area       = ( [*grid_dim_names], mesh.area, {"units" : "radians^2"} ),
+            data_vars=dict(
+                grid_dims       = (["grid_rank"],                              grid_dims),
+                grid_imask      = ([*grid_dim_names],                          mesh.mask.reshape(mesh.shape)),
+                grid_center_lat = ([*grid_dim_names],                          mesh.face_lat.reshape(mesh.shape), {"units": "radians"}),
+                grid_center_lon = ([*grid_dim_names],                          mesh.face_lon.reshape(mesh.shape), {"units": "radians"}),
+                grid_corner_lat = ([*grid_dim_names, "grid_corners"],          corner_lat.reshape(*mesh.shape, grid_corners),   {"units": "radians"}),
+                grid_corner_lon = ([*grid_dim_names, "grid_corners"],          corner_lon.reshape(*mesh.shape, grid_corners),   {"units": "radians"}),
+                grid_area       = ([*grid_dim_names],                          area_sr.reshape(mesh.shape),     {"units": "radians^2"}),
             ),
         )
 
-    ds.attrs["title"] = "Displaced pole grid (Madec and Imbard, 1996)"
+    ds.attrs["title"] = mesh.attrs.get("title", "")
     ds.to_netcdf(output_file)
 
 
-def write_to_2D_grid_file(mesh: DisplacedPoleMesh, output_file):
+def write_to_2D_grid_file(mesh: GridMesh, output_file):
     """
     Write `mesh` as a plain 2D (j, i) file for quick inspection in ncview.
 
@@ -1541,27 +1456,23 @@ def write_to_2D_grid_file(mesh: DisplacedPoleMesh, output_file):
     import xarray as xr
 
     nj, ni = mesh.shape
-    ratio = np.maximum(mesh.e1 / mesh.e2, mesh.e2 / mesh.e1)
     rad2deg = 180.0 / np.pi
 
     coords = {"j": np.arange(nj), "i": np.arange(ni)}
-    field = lambda data, units, long_name: (
+    field  = lambda data, units, long_name: (
         ["j", "i"], data, {"units": units, "long_name": long_name, "coordinates": "lon lat"}
     )
 
     ds = xr.Dataset(
-        data_vars = dict(
-            lon        = ( ["j", "i"], mesh.center_lon * rad2deg, {"units": "degrees_east",  "long_name": "cell centre longitude"} ),
-            lat        = ( ["j", "i"], mesh.center_lat * rad2deg, {"units": "degrees_north", "long_name": "cell centre latitude"} ),
-            e1         = field(mesh.e1 / 1.0e3, "km",         "zonal scale factor"),
-            e2         = field(mesh.e2 / 1.0e3, "km",         "meridional scale factor"),
-            anisotropy = field(ratio,           "1",          "max(e1/e2, e2/e1)"),
-            area       = field(mesh.area,       "steradian",  "cell solid angle"),
-            mask       = field(mesh.mask,       "1",          "1 = active cell"),
+        data_vars=dict(
+            lon  = (["j", "i"], mesh.face_lon.reshape(mesh.shape) * rad2deg, {"units": "degrees_east",  "long_name": "cell centre longitude"}),
+            lat  = (["j", "i"], mesh.face_lat.reshape(mesh.shape) * rad2deg, {"units": "degrees_north", "long_name": "cell centre latitude"}),
+            area = field(mesh.area.reshape(mesh.shape), "m2", "cell area"),
+            mask = field(mesh.mask.reshape(mesh.shape), "1",  "1 = active cell"),
         ),
-        coords = coords,
+        coords=coords,
     )
-    ds.attrs["title"] = "Displaced pole grid (Madec and Imbard, 1996), 2D view for ncview"
+    ds.attrs["title"] = mesh.attrs.get("title", "") + ", 2D view for ncview"
     ds.to_netcdf(output_file)
 
 
@@ -1701,18 +1612,16 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
     print("Assembling mesh...")
     mesh = grid.generate_mesh()
     nj, ni = mesh.shape
-    print(f"  {nj} x {ni} cells, {mesh.number_of_rows_in_SH} of them south of the equator")
-    print(f"  latitude {np.rad2deg(mesh.center_lat.min()):+.2f} .. "
-          f"{np.rad2deg(mesh.center_lat.max()):+.2f} deg")
-    print(f"  e1 {mesh.e1.min()/1e3:.1f} .. {mesh.e1.max()/1e3:.1f} km, "
-          f"e2 {mesh.e2.min()/1e3:.1f} .. {mesh.e2.max()/1e3:.1f} km")
-    print(f"  total solid angle {mesh.area.sum():.6f} sr")
+    nj_S = mesh.attrs.get("number_of_rows_in_SH", "?")
+    print(f"  {nj} x {ni} cells, {nj_S} of them south of the equator")
+    print(f"  latitude {np.rad2deg(mesh.face_lat.min()):+.2f} .. "
+          f"{np.rad2deg(mesh.face_lat.max()):+.2f} deg")
+    print(f"  total area {mesh.area.sum()/1e12:.3f} million km²")
 
     if mask_land:
         apply_ocean_mask(mesh)
         ocean = mesh.mask.sum()
-        # area-weighted, since the cells are wildly unequal on this mesh
-        frac = (mesh.area*mesh.mask).sum()/mesh.area.sum()
+        frac  = (mesh.area * mesh.mask).sum() / mesh.area.sum()
         print(f"  ocean mask: {ocean} of {mesh.mask.size} cells wet "
               f"({100*ocean/mesh.mask.size:.1f}% by count, "
               f"{100*frac:.1f}% by area)")
@@ -1768,8 +1677,9 @@ def test_plot_grid(stride_j: int = 1, stride_i: int = 1, output_file: str = None
 
     grid = build_example_grid(formulation=formulation, **grid_kwargs)
     mesh = grid.generate_mesh()
-    lon = mesh.corner_lon[:, :, 0]
-    lat = mesh.corner_lat[:, :, 0]
+    nj, ni = mesh.shape
+    lon = mesh.node_lon[mesh.face_nodes[:, 0]].reshape(nj, ni)
+    lat = mesh.node_lat[mesh.face_nodes[:, 0]].reshape(nj, ni)
     xyz = spherical_to_cartesian(np.stack((lon.ravel(), lat.ravel()), axis=0))
     x, y, z = (c.reshape(lon.shape) for c in xyz)
     print("lon.shape = ", lon.shape)
@@ -1954,9 +1864,9 @@ def test_plot_stereographic(output_file: str = None,
 
     grid = build_example_grid(formulation=formulation, **grid_kwargs)
     mesh = grid.generate_mesh()
-
-    lon = mesh.corner_lon[:, :, 0]
-    lat = mesh.corner_lat[:, :, 0]
+    nj, ni = mesh.shape
+    lon = mesh.node_lon[mesh.face_nodes[:, 0]].reshape(nj, ni)
+    lat = mesh.node_lat[mesh.face_nodes[:, 0]].reshape(nj, ni)
     x, y = spherical_to_stereo(lon, lat)
 
     fig, ax = plt.subplots(figsize=(8.5, 8.5))
