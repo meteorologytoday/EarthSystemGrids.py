@@ -1,11 +1,11 @@
+from __future__ import annotations
+
 import numpy as np
 from numpy.linalg import norm
 from numpy import sin, cos, atan2, asin, stack
 from dataclasses import dataclass
 from typing import List
-from global_land_mask import globe
 from pathlib import Path
-from jax_esm.tool_scripts.generate_jcm_forcing_and_topography_files import generate_jcm_forcing_and_topography_files
 import xarray as xr
 
 @dataclass
@@ -56,32 +56,66 @@ def compute_solid_angle(r_corners_spherical):
 
     return solid_angles
 
+def _horizontal_grid_for_resolution(resolution: int):
+    """
+    The dinosaur.spherical_harmonic.Grid for a JCM spectral truncation.
+
+    Mirrors jcm.utils.get_coords's own horizontal-grid selection, without
+    the vertical-coordinate / physics machinery that function also builds:
+    JCMGrid only needs the horizontal grid's node coordinates and
+    quadrature weights, not a full model CoordinateSystem. T63 has no
+    dedicated dinosaur.spherical_harmonic.Grid.T63 factory, so it is built
+    directly via Grid.construct with the same (max_wavenumber=63,
+    gaussian_nodes=48) pairing jcm.utils.get_coords uses, which reproduces
+    the standard 192 x 96 ECHAM T63 grid.
+    """
+    import dinosaur.spherical_harmonic as dsh
+    from jcm.utils import VALID_TRUNCATIONS
+
+    if resolution not in VALID_TRUNCATIONS:
+        raise ValueError(
+            f"Invalid resolution (spectral truncation) {resolution}. "
+            f"Must be one of: {VALID_TRUNCATIONS}."
+        )
+    if resolution == 63:
+        return dsh.Grid.construct(max_wavenumber=63, gaussian_nodes=48)
+    return getattr(dsh.Grid, f"T{resolution}")()
+
+
+def _latitude_bounds(lat_centers):
+    """
+    Cell-edge latitudes bisecting between consecutive Gaussian latitude
+    centres, with the two outer edges clamped to the poles.
+
+    Gaussian quadrature latitudes are not evenly spaced (they compress
+    towards the poles), so there is no single dlat the way there is for
+    the model's uniformly-spaced longitudes. A naive symmetric
+    extrapolation of the outermost centres falls noticeably short of the
+    true pole (~1 deg short at T31) -- consistent with the model's own
+    grid.quadrature_weights, whose exact sum over the whole grid is 4*pi,
+    the outermost band's cell extends all the way to +/-pi/2.
+    """
+    midpoints = 0.5 * (lat_centers[1:] + lat_centers[:-1])
+    return np.concatenate([[-np.pi/2], midpoints, [np.pi/2]])
+
+
 def generate_JCMGrid(
     resolution: int,
 ):
-    files = generate_jcm_forcing_and_topography_files(resolution) 
-    ds_terrain = xr.open_dataset(files["terrain"]) 
-   
-    lat_centers = ds_terrain.coords["lat"].to_numpy() * np.pi/180 
-    lon_centers = ds_terrain.coords["lon"].to_numpy() * np.pi/180
-    dlat = lat_centers[1] - lat_centers[0]    
-    dlon = lon_centers[1] - lon_centers[0]
-   
-    if dlat <= 0:
-        raise ValueError("dlat is negative")
-    if dlon <= 0:
-        raise ValueError("dlon is negative")
-    if np.any( np.abs( (lat_centers[1:] - lat_centers[:-1]) - dlat ) > 1e-3 ):
-        raise Exception("Error: latitudes spacings are not equal")
-    if np.any( np.abs( (lon_centers[1:] - lon_centers[:-1]) - dlon ) > 1e-3 ):
-        raise Exception("Error: longtitudes spacings are not equal")
-    
-    nlat = len(lat_centers) 
-    nlon = len(lon_centers)
+    horizontal_grid = _horizontal_grid_for_resolution(resolution)
 
-    lat_bounds = np.linspace(lat_centers[0] - dlat/2, lat_centers[-1] + dlat/2, nlat+1) 
+    # jcm/dinosaur's own native grid: longitude is uniformly spaced and
+    # spans the full periodic 360 deg (so the same linspace-of-bounds
+    # construction the old terrain-file-based code used is still exact
+    # here); latitude is the non-uniform Gaussian quadrature grid.
+    lon_centers = np.asarray(horizontal_grid.longitudes)
+    lat_centers = np.asarray(horizontal_grid.latitudes)
+    nlon, nlat  = horizontal_grid.nodal_shape
+
+    dlon = lon_centers[1] - lon_centers[0]
     lon_bounds = np.linspace(lon_centers[0] - dlon/2, lon_centers[-1] + dlon/2, nlon+1)
- 
+    lat_bounds = _latitude_bounds(lat_centers)
+
     # JCM is lon-lat
     r_spherical = np.zeros((3, nlon, nlat))
     r_corners_spherical = np.zeros((3, 4, nlon, nlat))
@@ -93,13 +127,9 @@ def generate_JCMGrid(
             r_corners_spherical[:, 2, i, j] = [1.0, lon_bounds[i+1], lat_bounds[j+1]]
             r_corners_spherical[:, 3, i, j] = [1.0, lon_bounds[i], lat_bounds[j+1]]
 
-    # Construct land-sea mask
-    lon_deg = r_spherical[1, :] * 180/np.pi
-    lat_deg = r_spherical[2, :] * 180/np.pi
-    lon_deg[lon_deg > 180] -= 360.0
+    # Construct land-sea mask (placeholder: all ocean, no coastline data wired in)
+    binary_mask = np.ones((nlon, nlat))
 
-    binary_mask = np.ones_like(lon_deg)#globe.is_land( lat_deg, lon_deg )
-        
     # Construct solid angles
     grid_solid_angles = compute_solid_angle(r_corners_spherical)
 
