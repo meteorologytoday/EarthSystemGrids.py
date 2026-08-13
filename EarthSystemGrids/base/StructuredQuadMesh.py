@@ -67,6 +67,31 @@ class StructuredQuadMesh(UnstructuredGridMesh):
             attrs       = attrs or {},
         )
 
+    @classmethod
+    def from_CF_file(cls, input_file):
+        """
+        Load a StructuredQuadMesh back from a file written by
+        write_to_CF_grid_file.
+
+        See UnstructuredGridMesh.from_CF_file for what's actually read;
+        this just checks the result is a valid StructuredQuadMesh --
+        every face has exactly 4 corners and the logical shape is 2D --
+        rather than silently handing back an object that would fail later,
+        confusingly, inside rotation_angle() or write_to_SCRIP_grid_file.
+        """
+        mesh = super().from_CF_file(input_file)
+        if mesh.max_n_corners != 4 or np.any(mesh.n_nodes_per_face != 4):
+            raise ValueError(
+                f"{input_file!r} is not a uniform quadrilateral mesh -- "
+                "load it with UnstructuredGridMesh.from_CF_file instead."
+            )
+        if len(mesh.shape) != 2:
+            raise ValueError(
+                f"{input_file!r} has shape {mesh.shape}, not a 2D (nj, ni) "
+                "logical arrangement."
+            )
+        return mesh
+
     def rotation_angle(self):
         """
         Angle of the grid i-direction measured anticlockwise from true east,
@@ -109,12 +134,13 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         sin_component = np.sum(v * e_north, axis=-1)
         return np.arctan2(sin_component, cos_component)
 
-    def extra_variables(self):
+    def _compute_extra_variables(self):
         """
-        Contributes the rotation angle and its cosine/sine to
-        write_to_CF_grid_file. Meaningful only here: they need each face to
-        have a well-defined i-direction edge pair, which only a structured
-        quad mesh guarantees.
+        Contributes the rotation angle and its cosine/sine, computed once
+        at construction time (see UnstructuredGridMesh.__init__) and stored
+        in self.extra_variables for write_to_CF_grid_file to use. Meaningful
+        only here: they need each face to have a well-defined i-direction
+        edge pair, which only a structured quad mesh guarantees.
         """
         angle = self.rotation_angle()
         return {

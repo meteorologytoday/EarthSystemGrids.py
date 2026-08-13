@@ -68,6 +68,13 @@ class UnstructuredGridMesh:
                                                    (nj, ni) if structured,
                                                    else (nface,)
     attrs              : dict                     grid-specific metadata
+    extra_variables    : dict                     {name: xr.DataArray} of any
+                                                   subclass-specific CF variables
+                                                   (e.g. StructuredQuadMesh's
+                                                   rotation angle), computed once
+                                                   by _compute_extra_variables()
+                                                   at construction time -- see
+                                                   that method
     """
 
     def __init__(
@@ -97,6 +104,10 @@ class UnstructuredGridMesh:
         self.mask        = mask
         self.shape       = shape
         self.attrs       = attrs or {}
+        # computed last, since it may depend on every attribute above (e.g.
+        # StructuredQuadMesh's override calls rotation_angle(), which needs
+        # face_nodes/node_lon/node_lat/face_lon/face_lat already set)
+        self.extra_variables = self._compute_extra_variables()
 
     @property
     def max_n_corners(self):
@@ -108,16 +119,25 @@ class UnstructuredGridMesh:
         """(nface,) int: each face's true corner count, ignoring padding."""
         return np.count_nonzero(self.face_nodes != _FILL_VALUE, axis=1)
 
-    def extra_variables(self):
+    def _compute_extra_variables(self):
         """
-        Hook for subclasses to contribute to write_to_CF_grid_file.
+        Hook for subclasses to contribute subclass-specific CF variables.
 
-        Called last, after every base CF/UGRID variable has already been
-        added to the output dataset, so a subclass is free to add fields
-        that only it can define (e.g. a rotation angle that needs a
-        logical i-direction) or to replace a base variable outright by
-        returning its name again. UnstructuredGridMesh itself has no
-        subclass-specific fields, so this is empty.
+        Called once, at the end of __init__, and the result stored as
+        `self.extra_variables` -- a plain dict, not a method to call again
+        later. This is what makes those fields (e.g. StructuredQuadMesh's
+        rotation angle) come back automatically on every construction path,
+        including from_CF_file: loading a mesh just calls cls(...) like any
+        other constructor, so this hook reruns and recomputes them fresh
+        from the loaded geometry, rather than trusting whatever a NetCDF
+        file happened to have stored under those names.
+
+        A subclass overriding this may add fields (e.g. an angle that needs
+        a logical i-direction) or replace a base variable outright by
+        returning its name again; write_to_CF_grid_file applies
+        self.extra_variables last, after every base CF/UGRID variable.
+        UnstructuredGridMesh itself has no subclass-specific fields, so this
+        is empty.
 
         Returns
         -------
@@ -136,10 +156,10 @@ class UnstructuredGridMesh:
 
         Fields that only some mesh subclasses can define -- e.g. a
         rotation angle, which needs a logical i-direction -- are not
-        handled here at all. They come from `self.extra_variables()`,
-        called once every base variable below has been written; see
-        UnstructuredGridMesh.extra_variables and
-        StructuredQuadMesh.extra_variables.
+        handled here at all. They come from `self.extra_variables`, a dict
+        already computed at construction time; see
+        UnstructuredGridMesh._compute_extra_variables and
+        StructuredQuadMesh._compute_extra_variables.
         """
         rad2deg = 180.0 / np.pi
 
@@ -215,15 +235,60 @@ class UnstructuredGridMesh:
             attrs={"long_name": "edge length", "units": "m", **_EDGE_ATTRS},
         )
 
-        ds.update(self.extra_variables())
+        ds.update(self.extra_variables)
 
         ds.attrs = {
             "Conventions": "CF-1.10, UGRID-1.0",
             "history":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "shape":       np.array(self.shape, dtype=np.int64),
             **self.attrs,
         }
 
         ds.to_netcdf(output_file)
+
+    @classmethod
+    def from_CF_file(cls, input_file):
+        """
+        Load a mesh back from a file written by write_to_CF_grid_file.
+
+        This is a round-trip counterpart to that writer, not a general
+        UGRID-1.0 reader: it expects exactly the variable names, units and
+        the custom `shape` attribute write_to_CF_grid_file produces, rather
+        than following node_coordinates / face_node_connectivity etc.
+        indirection to support arbitrary UGRID files from other tools.
+
+        Called on StructuredQuadMesh, this constructs a StructuredQuadMesh
+        (see its override, which adds a validity check); called on
+        UnstructuredGridMesh directly, it constructs the base class. Either
+        way, extra_variables (e.g. StructuredQuadMesh's rotation angle) are
+        never read from the file even if present -- construction always
+        calls cls(...), which recomputes them fresh from the loaded
+        geometry via _compute_extra_variables(), the same as any other
+        constructor.
+        """
+        ds = xr.open_dataset(input_file, mask_and_scale=False)
+
+        deg2rad = np.pi / 180.0
+        # a length-1 array attribute (shape == (nface,)) round-trips through
+        # NetCDF as a bare scalar, not a 1-element array -- atleast_1d handles both
+        shape = tuple(int(n) for n in np.atleast_1d(ds.attrs["shape"]))
+        attrs = {k: v for k, v in ds.attrs.items()
+                 if k not in ("Conventions", "history", "shape")}
+
+        return cls(
+            node_lon    = ds["node_lon"].values * deg2rad,
+            node_lat    = ds["node_lat"].values * deg2rad,
+            edge_nodes  = ds["edge_nodes"].values,
+            edge_length = ds["edge_length"].values,
+            face_nodes  = ds["face_nodes"].values,
+            face_edges  = ds["face_edges"].values,
+            face_lon    = ds["face_lon"].values * deg2rad,
+            face_lat    = ds["face_lat"].values * deg2rad,
+            area        = ds["cell_area"].values,
+            mask        = ds["mask"].values,
+            shape       = shape,
+            attrs       = attrs,
+        )
 
     @classmethod
     def from_polygons(cls, face_corner_lon, face_corner_lat, face_lon, face_lat,
