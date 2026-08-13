@@ -1444,38 +1444,6 @@ def write_to_SCRIP_grid_file(mesh: StructuredQuadMesh, output_file, flatten: boo
     ds.to_netcdf(output_file)
 
 
-def write_to_2D_grid_file(mesh: StructuredQuadMesh, output_file):
-    """
-    Write `mesh` as a plain 2D (j, i) file for quick inspection in ncview.
-
-    ncview cannot read the SCRIP layout, which flattens every cell onto one
-    dimension. Here each field keeps its (j, i) shape and carries a
-    `coordinates = "lon lat"` attribute, so ncview will offer lon/lat as
-    curvilinear axes and every diagnostic can be displayed as an image.
-    """
-    import xarray as xr
-
-    nj, ni = mesh.shape
-    rad2deg = 180.0 / np.pi
-
-    coords = {"j": np.arange(nj), "i": np.arange(ni)}
-    field  = lambda data, units, long_name: (
-        ["j", "i"], data, {"units": units, "long_name": long_name, "coordinates": "lon lat"}
-    )
-
-    ds = xr.Dataset(
-        data_vars=dict(
-            lon  = (["j", "i"], mesh.face_lon.reshape(mesh.shape) * rad2deg, {"units": "degrees_east",  "long_name": "cell centre longitude"}),
-            lat  = (["j", "i"], mesh.face_lat.reshape(mesh.shape) * rad2deg, {"units": "degrees_north", "long_name": "cell centre latitude"}),
-            area = field(mesh.area.reshape(mesh.shape), "m2", "cell area"),
-            mask = field(mesh.mask.reshape(mesh.shape), "1",  "1 = active cell"),
-        ),
-        coords=coords,
-    )
-    ds.attrs["title"] = mesh.attrs.get("title", "") + ", 2D view for ncview"
-    ds.to_netcdf(output_file)
-
-
 def build_example_grid(pole_longitude_degree: float = None,
                        number_of_rows_in_NH: int = 30,
                        number_of_columns: int = 120,
@@ -1603,7 +1571,7 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
                            mask_land: bool = True, **grid_kwargs):
     """
     Write both output files: the SCRIP grid for ESMF_RegridWeightGen, and a
-    plain (j, i) file that ncview can display directly.
+    CF-1.10 / UGRID-1.0 grid file via write_to_CF_grid_file.
     """
     print("Generating grid...")
     grid = build_example_grid(formulation=formulation, **grid_kwargs)
@@ -1630,7 +1598,7 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
     write_to_SCRIP_grid_file(mesh, scrip_file)
 
     print("Writing to file: ", twod_file)
-    write_to_2D_grid_file(mesh, twod_file)
+    mesh.write_to_CF_grid_file(twod_file)
 
 
 def test_plot_grid_naive(output_file: str = None,
@@ -1944,12 +1912,13 @@ if __name__ == "__main__":
     for name, kwargs in FORMULATIONS:
         print(f"--- {name} ---")
 
+        # v_min_degree belongs to the derivative plot only
+        mesh_kwargs = {k: v for k, v in kwargs.items() if k != "v_min_degree"}
+
+        """
         print("  f' and g' ...")
         test_plot_fg_derivatives(output_file=f"figure_fg_derivative_{name}.svg",
                                  formulation=name, **kwargs)
-
-        # v_min_degree belongs to the derivative plot only
-        mesh_kwargs = {k: v for k, v in kwargs.items() if k != "v_min_degree"}
 
         print("  mesh on the sphere ...")
         test_plot_grid(output_file=f"figure_grid_{name}.svg",
@@ -1958,7 +1927,7 @@ if __name__ == "__main__":
         print("  mesh in the stereographic plane ...")
         test_plot_stereographic(output_file=f"figure_stereographic_{name}.svg",
                                 formulation=name, **mesh_kwargs)
-
+        """
         print("  grid files ...")
         test_output_SCRIP_file(scrip_file=f"grid_displaced_pole_{name}_SCRIP.nc",
                                twod_file=f"grid_displaced_pole_{name}_2D.nc",

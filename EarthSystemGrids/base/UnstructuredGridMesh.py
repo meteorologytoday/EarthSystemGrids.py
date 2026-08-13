@@ -125,6 +125,106 @@ class UnstructuredGridMesh:
         """
         return {}
 
+    def write_to_CF_grid_file(self, output_file):
+        """
+        Write this mesh to a CF-1.10 / UGRID-1.0 NetCDF file.
+
+        Where a face's corner count is below max_n_corners, the padding
+        slots in face_nodes / face_edges are marked with a `_FillValue`,
+        per the UGRID convention for meshes that do not have a uniform
+        face arity.
+
+        Fields that only some mesh subclasses can define -- e.g. a
+        rotation angle, which needs a logical i-direction -- are not
+        handled here at all. They come from `self.extra_variables()`,
+        called once every base variable below has been written; see
+        UnstructuredGridMesh.extra_variables and
+        StructuredQuadMesh.extra_variables.
+        """
+        rad2deg = 180.0 / np.pi
+
+        ds = xr.Dataset()
+
+        ds["mesh"] = xr.DataArray(
+            np.int32(0),
+            attrs={
+                "cf_role":                "mesh_topology",
+                "topology_dimension":     np.int32(2),
+                "node_coordinates":       "node_lon node_lat",
+                "face_node_connectivity": "face_nodes",
+                "face_edge_connectivity": "face_edges",
+                "edge_node_connectivity": "edge_nodes",
+                "face_coordinates":       "face_lon face_lat",
+            },
+        )
+
+        ds["node_lon"] = xr.DataArray(
+            self.node_lon * rad2deg, dims=["nnode"],
+            attrs={"standard_name": "longitude", "units": "degrees_east"},
+        )
+        ds["node_lat"] = xr.DataArray(
+            self.node_lat * rad2deg, dims=["nnode"],
+            attrs={"standard_name": "latitude", "units": "degrees_north"},
+        )
+
+        ragged = bool(np.any(self.face_nodes == _FILL_VALUE))
+
+        ds["face_nodes"] = xr.DataArray(
+            self.face_nodes.astype(np.int32), dims=["nface", "max_face_nodes"],
+            attrs={"cf_role": "face_node_connectivity", "start_index": np.int32(0)},
+        )
+        ds["face_edges"] = xr.DataArray(
+            self.face_edges.astype(np.int32), dims=["nface", "max_face_nodes"],
+            attrs={"cf_role": "face_edge_connectivity", "start_index": np.int32(0)},
+        )
+        # _FillValue must travel via encoding, not attrs, or xarray raises on write.
+        ds["face_nodes"].encoding["_FillValue"] = np.int32(_FILL_VALUE) if ragged else None
+        ds["face_edges"].encoding["_FillValue"] = np.int32(_FILL_VALUE) if ragged else None
+
+        ds["edge_nodes"] = xr.DataArray(
+            self.edge_nodes.astype(np.int32), dims=["nedge", "two"],
+            attrs={"cf_role": "edge_node_connectivity", "start_index": np.int32(0)},
+        )
+
+        ds["face_lon"] = xr.DataArray(
+            self.face_lon * rad2deg, dims=["nface"],
+            attrs={"standard_name": "longitude", "units": "degrees_east"},
+        )
+        ds["face_lat"] = xr.DataArray(
+            self.face_lat * rad2deg, dims=["nface"],
+            attrs={"standard_name": "latitude", "units": "degrees_north"},
+        )
+
+        ds["cell_area"] = xr.DataArray(
+            self.area, dims=["nface"],
+            attrs={"standard_name": "cell_area", "units": "m2", **_FACE_ATTRS},
+        )
+        ds["mask"] = xr.DataArray(
+            self.mask.astype(np.int32), dims=["nface"],
+            attrs={
+                "long_name":     "ocean mask",
+                "units":         "1",
+                "flag_values":   np.array([0, 1], dtype=np.int32),
+                "flag_meanings": "land ocean",
+                **_FACE_ATTRS,
+            },
+        )
+
+        ds["edge_length"] = xr.DataArray(
+            self.edge_length, dims=["nedge"],
+            attrs={"long_name": "edge length", "units": "m", **_EDGE_ATTRS},
+        )
+
+        ds.update(self.extra_variables())
+
+        ds.attrs = {
+            "Conventions": "CF-1.10, UGRID-1.0",
+            "history":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **self.attrs,
+        }
+
+        ds.to_netcdf(output_file)
+
     @classmethod
     def from_polygons(cls, face_corner_lon, face_corner_lat, face_lon, face_lat,
                       area, mask, attrs=None, node_atol=1e-10):
@@ -252,105 +352,6 @@ def apply_ocean_mask(mesh: UnstructuredGridMesh) -> UnstructuredGridMesh:
     lat = np.clip(lat, -89.999, 89.999)
     mesh.mask = np.where(globe.is_land(lat, lon), 0, 1).astype(np.int32)
     return mesh
-
-
-def write_to_CF_grid_file(mesh: UnstructuredGridMesh, output_file):
-    """
-    Write mesh to a CF-1.10 / UGRID-1.0 NetCDF file.
-
-    Where a face's corner count is below max_n_corners, the padding slots
-    in face_nodes / face_edges are marked with a `_FillValue`, per the
-    UGRID convention for meshes that do not have a uniform face arity.
-
-    Fields that only some mesh subclasses can define -- e.g. a rotation
-    angle, which needs a logical i-direction -- are not handled here at
-    all. They come from `mesh.extra_variables()`, called once every base
-    variable below has been written; see UnstructuredGridMesh.extra_variables
-    and StructuredQuadMesh.extra_variables.
-    """
-    rad2deg = 180.0 / np.pi
-
-    ds = xr.Dataset()
-
-    ds["mesh"] = xr.DataArray(
-        np.int32(0),
-        attrs={
-            "cf_role":                "mesh_topology",
-            "topology_dimension":     np.int32(2),
-            "node_coordinates":       "node_lon node_lat",
-            "face_node_connectivity": "face_nodes",
-            "face_edge_connectivity": "face_edges",
-            "edge_node_connectivity": "edge_nodes",
-            "face_coordinates":       "face_lon face_lat",
-        },
-    )
-
-    ds["node_lon"] = xr.DataArray(
-        mesh.node_lon * rad2deg, dims=["nnode"],
-        attrs={"standard_name": "longitude", "units": "degrees_east"},
-    )
-    ds["node_lat"] = xr.DataArray(
-        mesh.node_lat * rad2deg, dims=["nnode"],
-        attrs={"standard_name": "latitude", "units": "degrees_north"},
-    )
-
-    ragged = bool(np.any(mesh.face_nodes == _FILL_VALUE))
-
-    ds["face_nodes"] = xr.DataArray(
-        mesh.face_nodes.astype(np.int32), dims=["nface", "max_face_nodes"],
-        attrs={"cf_role": "face_node_connectivity", "start_index": np.int32(0)},
-    )
-    ds["face_edges"] = xr.DataArray(
-        mesh.face_edges.astype(np.int32), dims=["nface", "max_face_nodes"],
-        attrs={"cf_role": "face_edge_connectivity", "start_index": np.int32(0)},
-    )
-    # _FillValue must travel via encoding, not attrs, or xarray raises on write.
-    ds["face_nodes"].encoding["_FillValue"] = np.int32(_FILL_VALUE) if ragged else None
-    ds["face_edges"].encoding["_FillValue"] = np.int32(_FILL_VALUE) if ragged else None
-
-    ds["edge_nodes"] = xr.DataArray(
-        mesh.edge_nodes.astype(np.int32), dims=["nedge", "two"],
-        attrs={"cf_role": "edge_node_connectivity", "start_index": np.int32(0)},
-    )
-
-    ds["face_lon"] = xr.DataArray(
-        mesh.face_lon * rad2deg, dims=["nface"],
-        attrs={"standard_name": "longitude", "units": "degrees_east"},
-    )
-    ds["face_lat"] = xr.DataArray(
-        mesh.face_lat * rad2deg, dims=["nface"],
-        attrs={"standard_name": "latitude", "units": "degrees_north"},
-    )
-
-    ds["cell_area"] = xr.DataArray(
-        mesh.area, dims=["nface"],
-        attrs={"standard_name": "cell_area", "units": "m2", **_FACE_ATTRS},
-    )
-    ds["mask"] = xr.DataArray(
-        mesh.mask.astype(np.int32), dims=["nface"],
-        attrs={
-            "long_name":     "ocean mask",
-            "units":         "1",
-            "flag_values":   np.array([0, 1], dtype=np.int32),
-            "flag_meanings": "land ocean",
-            **_FACE_ATTRS,
-        },
-    )
-
-    ds["edge_length"] = xr.DataArray(
-        mesh.edge_length, dims=["nedge"],
-        attrs={"long_name": "edge length", "units": "m", **_EDGE_ATTRS},
-    )
-
-    ds.update(mesh.extra_variables())
-
-    ds.attrs = {
-        "Conventions": "CF-1.10, UGRID-1.0",
-        "history":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        **mesh.attrs,
-    }
-
-    ds.to_netcdf(output_file)
 
 
 def _great_circle_lengths(lon1, lat1, lon2, lat2):
