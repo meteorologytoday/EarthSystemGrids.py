@@ -2,7 +2,7 @@ import numpy as np
 import xarray as xr
 
 from EarthSystemGrids.base.UnstructuredGridMesh import (
-    UnstructuredGridMesh, _great_circle_lengths, _FACE_ATTRS,
+    UnstructuredGridMesh, _great_circle_lengths, _FACE_ATTRS, _R_EARTH,
 )
 
 
@@ -66,6 +66,57 @@ class StructuredQuadMesh(UnstructuredGridMesh):
             shape       = shape,
             attrs       = attrs or {},
         )
+
+    def write_to_SCRIP_grid_file(self, output_file, flatten: bool = True):
+        """
+        Write this mesh as a SCRIP grid file, readable by
+        ESMF_RegridWeightGen (and by extension ncremap, which wraps it).
+
+        With flatten=True the cells are collapsed onto a single
+        `grid_size` dimension and written in degrees, which is the
+        portable form. With flatten=False the (lat, lon) structure is
+        kept and radians are used, which is easier to inspect but relies
+        on the reader honouring grid_dims.
+        """
+        import xarray as xr
+
+        nj, ni = self.shape
+        grid_corners   = self.n_corners
+        grid_dims      = [ni, nj]   # ESMF reads in reverse array order; undocumented
+        grid_dim_names = ["lat", "lon"]
+        rad2deg        = 180.0 / np.pi
+
+        corner_lon = self.node_lon[self.face_nodes]  # (nface, N)
+        corner_lat = self.node_lat[self.face_nodes]
+        area_sr    = self.area / _R_EARTH**2          # m² → steradians for SCRIP
+
+        if flatten:
+            ds = xr.Dataset(
+                data_vars=dict(
+                    grid_dims       = (["grid_rank"],                  grid_dims),
+                    grid_imask      = (["grid_size"],                  self.mask),
+                    grid_center_lat = (["grid_size"],                  self.face_lat * rad2deg, {"units": "degrees"}),
+                    grid_center_lon = (["grid_size"],                  self.face_lon * rad2deg, {"units": "degrees"}),
+                    grid_corner_lat = (["grid_size", "grid_corners"],  corner_lat    * rad2deg, {"units": "degrees"}),
+                    grid_corner_lon = (["grid_size", "grid_corners"],  corner_lon    * rad2deg, {"units": "degrees"}),
+                    grid_area       = (["grid_size"],                  area_sr,                 {"units": "radians^2"}),
+                ),
+            )
+        else:
+            ds = xr.Dataset(
+                data_vars=dict(
+                    grid_dims       = (["grid_rank"],                              grid_dims),
+                    grid_imask      = ([*grid_dim_names],                          self.mask.reshape(self.shape)),
+                    grid_center_lat = ([*grid_dim_names],                          self.face_lat.reshape(self.shape), {"units": "radians"}),
+                    grid_center_lon = ([*grid_dim_names],                          self.face_lon.reshape(self.shape), {"units": "radians"}),
+                    grid_corner_lat = ([*grid_dim_names, "grid_corners"],          corner_lat.reshape(*self.shape, grid_corners),   {"units": "radians"}),
+                    grid_corner_lon = ([*grid_dim_names, "grid_corners"],          corner_lon.reshape(*self.shape, grid_corners),   {"units": "radians"}),
+                    grid_area       = ([*grid_dim_names],                          area_sr.reshape(self.shape),     {"units": "radians^2"}),
+                ),
+            )
+
+        ds.attrs["title"] = self.attrs.get("title", "")
+        ds.to_netcdf(output_file)
 
     @classmethod
     def from_CF_file(cls, input_file):

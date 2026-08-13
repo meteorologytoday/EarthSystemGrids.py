@@ -4,7 +4,7 @@ import functools
 import numpy as np
 from scipy.optimize import brentq
 
-from EarthSystemGrids.base import StructuredQuadMesh, apply_ocean_mask, _R_EARTH
+from EarthSystemGrids.base import StructuredQuadMesh, apply_ocean_mask
 
 # The northern branch runs from the equator to the mesh north pole, and the
 # pseudo-latitude v mirrors geographic latitude, so the pole sits at v = pi/2.
@@ -1394,56 +1394,6 @@ def _spherical_excess(lon, lat):
 
 
 
-def write_to_SCRIP_grid_file(mesh: StructuredQuadMesh, output_file, flatten: bool = True):
-    """
-    Write `mesh` as a SCRIP grid file, readable by ESMF_RegridWeightGen.
-
-    With flatten=True the cells are collapsed onto a single `grid_size`
-    dimension and written in degrees, which is the portable form. With
-    flatten=False the (lat, lon) structure is kept and radians are used,
-    which is easier to inspect but relies on the reader honouring grid_dims.
-    """
-    import xarray as xr
-
-    nj, ni = mesh.shape
-    grid_corners   = mesh.n_corners
-    grid_dims      = [ni, nj]   # ESMF reads in reverse array order; undocumented
-    grid_dim_names = ["lat", "lon"]
-    rad2deg        = 180.0 / np.pi
-
-    corner_lon = mesh.node_lon[mesh.face_nodes]  # (nface, N)
-    corner_lat = mesh.node_lat[mesh.face_nodes]
-    area_sr    = mesh.area / _R_EARTH**2          # m² → steradians for SCRIP
-
-    if flatten:
-        ds = xr.Dataset(
-            data_vars=dict(
-                grid_dims       = (["grid_rank"],                  grid_dims),
-                grid_imask      = (["grid_size"],                  mesh.mask),
-                grid_center_lat = (["grid_size"],                  mesh.face_lat * rad2deg, {"units": "degrees"}),
-                grid_center_lon = (["grid_size"],                  mesh.face_lon * rad2deg, {"units": "degrees"}),
-                grid_corner_lat = (["grid_size", "grid_corners"],  corner_lat    * rad2deg, {"units": "degrees"}),
-                grid_corner_lon = (["grid_size", "grid_corners"],  corner_lon    * rad2deg, {"units": "degrees"}),
-                grid_area       = (["grid_size"],                  area_sr,                 {"units": "radians^2"}),
-            ),
-        )
-    else:
-        ds = xr.Dataset(
-            data_vars=dict(
-                grid_dims       = (["grid_rank"],                              grid_dims),
-                grid_imask      = ([*grid_dim_names],                          mesh.mask.reshape(mesh.shape)),
-                grid_center_lat = ([*grid_dim_names],                          mesh.face_lat.reshape(mesh.shape), {"units": "radians"}),
-                grid_center_lon = ([*grid_dim_names],                          mesh.face_lon.reshape(mesh.shape), {"units": "radians"}),
-                grid_corner_lat = ([*grid_dim_names, "grid_corners"],          corner_lat.reshape(*mesh.shape, grid_corners),   {"units": "radians"}),
-                grid_corner_lon = ([*grid_dim_names, "grid_corners"],          corner_lon.reshape(*mesh.shape, grid_corners),   {"units": "radians"}),
-                grid_area       = ([*grid_dim_names],                          area_sr.reshape(mesh.shape),     {"units": "radians^2"}),
-            ),
-        )
-
-    ds.attrs["title"] = mesh.attrs.get("title", "")
-    ds.to_netcdf(output_file)
-
-
 def build_example_grid(pole_longitude_degree: float = None,
                        number_of_rows_in_NH: int = 30,
                        number_of_columns: int = 120,
@@ -1595,7 +1545,7 @@ def test_output_grid_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
               f"{100*frac:.1f}% by area)")
 
     print("Writing to file: ", scrip_file)
-    write_to_SCRIP_grid_file(mesh, scrip_file)
+    mesh.write_to_SCRIP_grid_file(scrip_file)
 
     print("Writing to file: ", cf_file)
     mesh.write_to_CF_grid_file(cf_file)
