@@ -14,10 +14,11 @@ class StructuredQuadMesh(UnstructuredGridMesh):
     "Uniform N-sided cells" belongs here, as a specialization -- it exploits
     the structured index arithmetic in `_build_topology_2d` to build
     node/edge connectivity without floating-point coordinate matching, and
-    it is what unlocks the rotation angle, which needs a logical
-    i-direction to take a centred difference along. General polygon meshes
-    use `UnstructuredGridMesh.from_polygons` instead, and carry no `.shape`
-    beyond `(nface,)`, so neither shortcut applies to them.
+    it is what unlocks the rotation angle, which needs each face to have a
+    well-defined bottom/top edge pair (the i-direction) to estimate a
+    tangent from. General polygon meshes use `UnstructuredGridMesh.from_polygons`
+    instead, and carry no `.shape` beyond `(nface,)`, so neither shortcut
+    applies to them.
     """
 
     n_corners = 4
@@ -71,15 +72,49 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         Angle of the grid i-direction measured anticlockwise from true east,
         at every face centre. Matches CF standard_name
         angle_of_rotation_from_east_to_x.
+
+        Computed from each face's own SW/SE/NE/NW corners, not by
+        differencing neighbouring face centres. The corners are converted
+        to Cartesian unit vectors on the sphere; averaging the bottom edge
+        (SW->SE) and top edge (NW->NE) -- both of which run in the +i
+        direction -- estimates the local i-direction tangent, which is
+        then resolved against the true local east/north basis at the face
+        centre via a dot product.
+
+        This is exact spherical geometry, not the small-angle / flat-Earth
+        approximation a lon/lat finite difference scaled by cos(lat) would
+        be, so it stays correct near poles and in tightly refined regions.
+        It is also well-defined per face regardless of neighbours -- no
+        one-sided differencing needed at grid boundaries -- and has no
+        antimeridian seam to special-case, since Cartesian coordinates have
+        no seam to cross.
         """
-        return _rotation_angle(self.face_lon, self.face_lat, self.shape)
+        corner_lon = self.node_lon[self.face_nodes]   # (nface, 4): SW, SE, NE, NW
+        corner_lat = self.node_lat[self.face_nodes]
+        p = _unit_vectors(corner_lon, corner_lat)      # (nface, 4, 3)
+
+        # local i-direction tangent: average of the bottom edge (SW->SE) and
+        # top edge (NW->NE), both of which run in the +i direction
+        v = 0.5 * ((p[:, 1] - p[:, 0]) + (p[:, 2] - p[:, 3]))
+
+        lon0, lat0 = self.face_lon, self.face_lat
+        e_east  = np.stack([-np.sin(lon0), np.cos(lon0), np.zeros_like(lon0)], axis=-1)
+        e_north = np.stack([
+            -np.sin(lat0) * np.cos(lon0),
+            -np.sin(lat0) * np.sin(lon0),
+            np.cos(lat0),
+        ], axis=-1)
+
+        cos_component = np.sum(v * e_east,  axis=-1)
+        sin_component = np.sum(v * e_north, axis=-1)
+        return np.arctan2(sin_component, cos_component)
 
     def extra_variables(self):
         """
         Contributes the rotation angle and its cosine/sine to
-        write_to_CF_grid_file. Meaningful only here: they need a logical
-        i-direction to take a centred difference along, which only a
-        structured mesh has.
+        write_to_CF_grid_file. Meaningful only here: they need each face to
+        have a well-defined i-direction edge pair, which only a structured
+        quad mesh guarantees.
         """
         angle = self.rotation_angle()
         return {
@@ -118,6 +153,28 @@ def _build_topology_2d(corner_lon, corner_lat, shape):
     Note: i-periodic boundaries are not deduplicated. For a global grid the
     nodes at i=0 and i=ni are distinct in the output even though they represent
     the same geographic points.
+
+    Returns
+    -------
+    node_lon, node_lat : (nnode,)         nnode = (nj+1)*(ni+1)
+    face_nodes         : (nface, 4) int   nface = nj*ni; row-major over (j, i)
+    edge_nodes         : (nedge, 2) int   nedge = n_hedge + n_vedge, where
+                                           n_hedge = (nj+1)*ni, n_vedge = nj*(ni+1)
+    face_edges         : (nface, 4) int   indices into edge_nodes above
+
+    edge_nodes is laid out as two contiguous blocks, NOT interleaved per
+    face -- every horizontal edge in the mesh, then every vertical edge:
+
+      [0, n_hedge)             horizontal edges, index = j*ni + i,
+                                j in [0, nj] (all nj+1 row-lines),
+                                i in [0, ni-1] (gaps along each row-line)
+      [n_hedge, n_hedge+n_vedge)  vertical edges, index = n_hedge + j*(ni+1) + i,
+                                j in [0, nj-1] (each of the nj rows),
+                                i in [0, ni] (all ni+1 column-lines per row)
+
+    face_edges' bottom/top entries index into the horizontal block; its
+    right/left entries add the n_hedge offset to reach into the vertical
+    block.
     """
     n_corners = 4
     nj, ni = shape
@@ -173,29 +230,10 @@ def _build_topology_2d(corner_lon, corner_lat, shape):
     return node_lon, node_lat, face_nodes, edge_nodes, face_edges
 
 
-def _rotation_angle(face_lon, face_lat, shape):
-    """
-    Angle of the grid i-direction measured anticlockwise from true east.
-    Matches CF standard_name angle_of_rotation_from_east_to_x.
-    Uses central differences in i with one-sided differences at i-boundaries.
-    Only implemented for 2D shape (i.e. StructuredQuadMesh).
-    """
-    if len(shape) != 2:
-        raise NotImplementedError(
-            f"Rotation angle only implemented for 2D shape; got {len(shape)}D"
-        )
-    lon = face_lon.reshape(shape)
-    lat = face_lat.reshape(shape)
-
-    dlon = np.empty_like(lon)
-    dlat = np.empty_like(lat)
-
-    dlon[:, 1:-1] = lon[:, 2:] - lon[:, :-2]
-    dlat[:, 1:-1] = lat[:, 2:] - lat[:, :-2]
-    dlon[:, 0]    = lon[:, 1]  - lon[:, 0]
-    dlat[:, 0]    = lat[:, 1]  - lat[:, 0]
-    dlon[:, -1]   = lon[:, -1] - lon[:, -2]
-    dlat[:, -1]   = lat[:, -1] - lat[:, -2]
-
-    dlon = (dlon + np.pi) % (2.0*np.pi) - np.pi
-    return np.arctan2(dlat, dlon * np.cos(lat)).ravel()
+def _unit_vectors(lon, lat):
+    """Cartesian unit vectors on the sphere from radian lon/lat, stacked on the last axis."""
+    return np.stack([
+        np.cos(lat) * np.cos(lon),
+        np.cos(lat) * np.sin(lon),
+        np.sin(lat),
+    ], axis=-1)

@@ -31,15 +31,32 @@ class UnstructuredGridMesh:
     metres. The 1D storage (nnode / nedge / nface) is the canonical form;
     `.shape` records the logical arrangement, if the mesh has one.
 
+    Naming: these are UGRID connectivity arrays, and each name is short for
+    "X_Y_connectivity" -- read `face_nodes` as "for each face, its nodes"
+    and `face_edges` as "for each face, its edges", the same way UGRID
+    itself names `face_node_connectivity` / `face_edge_connectivity` /
+    `edge_node_connectivity`. Concretely:
+
+      face_nodes : face -> node.  Row f lists the node indices (corners)
+                   that bound face f, in CCW order.
+      edge_nodes : edge -> node.  Row e lists the 2 node indices that are
+                   edge e's endpoints.
+      face_edges : face -> edge.  Row f lists the edge indices that bound
+                   face f, in the same order as face_nodes[f]: entry k is
+                   the edge from face_nodes[f, k] to face_nodes[f, (k+1) % n_f].
+
     Attributes
     ----------
     node_lon, node_lat : (nnode,)                unique corner coordinates, radians
-    edge_nodes         : (nedge, 2) int           node indices of each edge's endpoints
+    edge_nodes         : (nedge, 2) int           edge -> node: the 2 endpoint
+                                                   node indices of each edge
     edge_length        : (nedge,)                 great-circle length, metres
-    face_nodes         : (nface, max_n_corners)   node indices per face, CCW,
+    face_nodes         : (nface, max_n_corners)   face -> node: the corner node
+                                                   indices of each face, CCW,
                                                    padded with _FILL_VALUE past
                                                    that face's own corner count
-    face_edges         : (nface, max_n_corners)   edge indices per face, padded
+    face_edges         : (nface, max_n_corners)   face -> edge: the bounding edge
+                                                   indices of each face, padded
                                                    the same way; edge k connects
                                                    face_nodes[f, k] to
                                                    face_nodes[f, (k+1) % n_f]
