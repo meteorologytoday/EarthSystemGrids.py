@@ -1565,8 +1565,8 @@ def build_example_grid(pole_longitude_degree: float = None,
     )
 
 
-def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
-                           twod_file: str = "grid_displaced_pole_2D.nc",
+def test_output_grid_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
+                           cf_file: str = "grid_displaced_pole_cf.nc",
                            formulation: str = "mi1996",
                            mask_land: bool = True, **grid_kwargs):
     """
@@ -1597,8 +1597,8 @@ def test_output_SCRIP_file(scrip_file: str = "grid_displaced_pole_SCRIP.nc",
     print("Writing to file: ", scrip_file)
     write_to_SCRIP_grid_file(mesh, scrip_file)
 
-    print("Writing to file: ", twod_file)
-    mesh.write_to_CF_grid_file(twod_file)
+    print("Writing to file: ", cf_file)
+    mesh.write_to_CF_grid_file(cf_file)
 
 
 def test_plot_grid_naive(output_file: str = None,
@@ -1929,6 +1929,6 @@ if __name__ == "__main__":
                                 formulation=name, **mesh_kwargs)
         """
         print("  grid files ...")
-        test_output_SCRIP_file(scrip_file=f"grid_displaced_pole_{name}_SCRIP.nc",
-                               twod_file=f"grid_displaced_pole_{name}_2D.nc",
+        test_output_grid_file(scrip_file=f"grid_displaced_pole_{name}_SCRIP.nc",
+                               cf_file=f"grid_displaced_pole_{name}_CF.nc",
                                formulation=name, **mesh_kwargs)
