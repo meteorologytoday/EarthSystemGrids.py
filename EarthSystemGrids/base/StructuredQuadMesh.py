@@ -77,6 +77,14 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         portable form. With flatten=False the (lat, lon) structure is
         kept and radians are used, which is easier to inspect but relies
         on the reader honouring grid_dims.
+
+        Also includes `grid_angle` (radians, always -- not degree-converted
+        under flatten=True, same convention as grid_area) plus its cosine
+        and sine, `grid_cos_angle` / `grid_sin_angle`: the rotation angle
+        from true east to the grid's i-direction, from rotation_angle().
+        None of the three are part of the classic SCRIP spec, but several
+        models that consume SCRIP files (for rotating vector components
+        onto the grid) expect angle fields under these names.
         """
         import xarray as xr
 
@@ -89,6 +97,9 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         corner_lon = self.node_lon[self.face_nodes]  # (nface, N)
         corner_lat = self.node_lat[self.face_nodes]
         area_sr    = self.area / _R_EARTH**2          # m² → steradians for SCRIP
+        angle      = self.rotation_angle()
+        cos_angle  = np.cos(angle)
+        sin_angle  = np.sin(angle)
 
         if flatten:
             ds = xr.Dataset(
@@ -100,6 +111,9 @@ class StructuredQuadMesh(UnstructuredGridMesh):
                     grid_corner_lat = (["grid_size", "grid_corners"],  corner_lat    * rad2deg, {"units": "degrees"}),
                     grid_corner_lon = (["grid_size", "grid_corners"],  corner_lon    * rad2deg, {"units": "degrees"}),
                     grid_area       = (["grid_size"],                  area_sr,                 {"units": "radians^2"}),
+                    grid_angle      = (["grid_size"],                  angle,                   {"units": "radians"}),
+                    grid_cos_angle  = (["grid_size"],                  cos_angle,               {"units": "1"}),
+                    grid_sin_angle  = (["grid_size"],                  sin_angle,               {"units": "1"}),
                 ),
             )
         else:
@@ -112,6 +126,9 @@ class StructuredQuadMesh(UnstructuredGridMesh):
                     grid_corner_lat = ([*grid_dim_names, "grid_corners"],          corner_lat.reshape(*self.shape, grid_corners),   {"units": "radians"}),
                     grid_corner_lon = ([*grid_dim_names, "grid_corners"],          corner_lon.reshape(*self.shape, grid_corners),   {"units": "radians"}),
                     grid_area       = ([*grid_dim_names],                          area_sr.reshape(self.shape),     {"units": "radians^2"}),
+                    grid_angle      = ([*grid_dim_names],                          angle.reshape(self.shape),       {"units": "radians"}),
+                    grid_cos_angle  = ([*grid_dim_names],                          cos_angle.reshape(self.shape),   {"units": "1"}),
+                    grid_sin_angle  = ([*grid_dim_names],                          sin_angle.reshape(self.shape),   {"units": "1"}),
                 ),
             )
 

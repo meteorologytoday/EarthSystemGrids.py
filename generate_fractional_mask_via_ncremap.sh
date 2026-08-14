@@ -1,7 +1,10 @@
 #!/bin/bash
 #
-# Regrid the ERA5 land-sea mask onto the JCM grid and the displaced-pole
-# grid, conservatively (area-weighted), via NCO's ncremap.
+# 1. Regrid the ERA5 land-sea mask onto the JCM grid and the displaced-pole
+#    grid, conservatively (area-weighted), via NCO's ncremap.
+# 2. Generate reusable ESMF regridding weight files directly between the
+#    JCM grid and the displaced-pole grid (no ERA5 involved), for both
+#    mapping directions and both bilinear and conservative methods.
 #
 # ERA5's `lsm` variable is already a fractional land-sea mask (0..1) at
 # 0.25deg, so conservatively remapping it directly gives a fractional mask
@@ -9,6 +12,12 @@
 # source grid from ERA5_landsea_mask.nc's own lat/lon coordinates; only the
 # two destination grids need an explicit SCRIP file, generated below from
 # this repo's own grid code.
+#
+# The JCM<->displaced-pole weight files ignore masking entirely -- every
+# cell on both grids is treated as valid. This holds by construction, not
+# by an extra flag: neither grid below has apply_ocean_mask applied, so
+# each SCRIP file's grid_imask is all 1s, and ESMF_RegridWeightGen simply
+# has nothing to exclude.
 #
 # Needs ncremap (NCO) and ESMF_RegridWeightGen on PATH.
 
@@ -26,9 +35,11 @@ JCM_RESOLUTION=31                  # spectral truncation, e.g. 31 -> T31
 DPG_NUMBER_OF_ROWS_NH=30
 DPG_NUMBER_OF_COLUMNS=120
 DPG_DLAT_IN_SH_DEGREE=3.0
-DPG_FORMULATION=mi1996
+DPG_FORMULATION=logcosh
 
 REMAP_ALGORITHM=conserve           # area-conservative: right choice for a fractional field
+
+WEIGHT_METHODS=(bilinear conserve) # ESMF_RegridWeightGen -m values for the JCM<->DPG weight files
 # -----------------------------------------------------------------------------
 
 if [ ! -f "$ERA5_FILE" ]; then
@@ -76,3 +87,15 @@ ncremap -a "${REMAP_ALGORITHM}" \
     -o "${OUTPUT_DIR}/landsea_mask_fraction_DisplacedPoleGrid.nc"
 
 echo "Done. Fractional masks written to ${OUTPUT_DIR}/"
+
+echo "Generating JCM <-> displaced-pole grid regridding weights ..."
+for method in "${WEIGHT_METHODS[@]}"; do
+    ESMF_RegridWeightGen \
+        -s "${jcm_scrip}" -d "${dpg_scrip}" -m "${method}" \
+        -w "${GRID_DIR}/weight_algo-${method}_JCM_T${JCM_RESOLUTION}_to_DisplacedPoleGrid.nc"
+    ESMF_RegridWeightGen \
+        -s "${dpg_scrip}" -d "${jcm_scrip}" -m "${method}" \
+        -w "${GRID_DIR}/weight_algo-${method}_DisplacedPoleGrid_to_JCM_T${JCM_RESOLUTION}.nc"
+done
+
+echo "Done. Regridding weights written to ${GRID_DIR}/"
