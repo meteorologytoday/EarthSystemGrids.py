@@ -10,3 +10,6 @@ This project also provides interactive Jupyter notebooks for education.
 4. Icosahedral
 5. ORCA ([tripolar grid](https://www.nemo-ocean.eu/doc/node108.html))
 6. Geodesic Grids
+
+# Grid I/O
+Grids can be written to and read back from SCRIP grid files, so they can be handed directly to `ESMF_RegridWeightGen` (or tools built on it, like `ncremap`) for remapping.
