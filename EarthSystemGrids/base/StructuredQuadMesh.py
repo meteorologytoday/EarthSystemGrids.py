@@ -162,6 +162,13 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         `extra_variables` field, the rotation angle is recomputed from
         geometry by StructuredQuadMesh._compute_extra_variables, not
         trusted from the file.
+
+        Deliberately does not call UnstructuredGridMesh.from_SCRIP_file via
+        super(): that method matches corners by floating-point proximity
+        and returns a 1D (nface,) shape, neither of which satisfies what
+        this class needs -- a 2D (nj, ni) shape and the structured
+        SW/SE/NE/NW connectivity rotation_angle relies on. This method
+        takes the cheaper structured-index path via from_corners instead.
         """
         ds = xr.open_dataset(input_file, mask_and_scale=False)
 

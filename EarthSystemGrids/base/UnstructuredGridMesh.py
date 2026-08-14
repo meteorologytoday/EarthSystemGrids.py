@@ -395,6 +395,84 @@ class UnstructuredGridMesh:
             attrs       = attrs or {},
         )
 
+    @classmethod
+    def from_SCRIP_file(cls, input_file, node_atol=1e-10):
+        """
+        Load a mesh from a SCRIP grid file.
+
+        This is the from_polygons analogue of from_SCRIP_file, above: a
+        general reader, not tied to any writer in this package (there is
+        no UnstructuredGridMesh.write_to_SCRIP_grid_file -- only
+        StructuredQuadMesh has one). It makes no assumption that every
+        face has the same true corner count or that the file has a 2D
+        logical shape, unlike StructuredQuadMesh.from_SCRIP_file.
+
+        SCRIP's grid_corner_lon/lat arrays are always rectangular
+        (grid_size, grid_corners), so a face with fewer real corners than
+        grid_corners is recovered by trimming trailing corners that
+        duplicate the previous one -- the common SCRIP convention for
+        mixed-arity meshes (e.g. MPAS output) -- before handing the ragged
+        per-face corner lists to from_polygons for floating-point
+        node/edge matching. grid_dims / grid_rank are not used to recover
+        a logical shape; the resulting mesh always has shape == (nface,),
+        same as from_polygons.
+
+        Called on StructuredQuadMesh, this method is NOT reused: that
+        class overrides from_SCRIP_file with its own implementation
+        rather than delegating to this one via super(), because the mesh
+        this method builds -- 1D shape, corners matched by float
+        proximity -- doesn't satisfy what StructuredQuadMesh needs (a 2D
+        (nj, ni) shape and the structured SW/SE/NE/NW connectivity that
+        rotation_angle relies on). StructuredQuadMesh.from_SCRIP_file
+        takes the fast structured-index path via from_corners instead of
+        the O(nface) floating-point matching here.
+
+        Parameters
+        ----------
+        input_file : path to a SCRIP grid file
+        node_atol  : float, radians. Corners within this tolerance of the
+                     previous one are treated as trailing padding rather
+                     than a real corner, and also passed through to
+                     from_polygons for shared-node matching.
+        """
+        ds = xr.open_dataset(input_file, mask_and_scale=False)
+
+        def _to_radians(da):
+            units = da.attrs.get("units", "radians")
+            values = da.values
+            return values * (np.pi / 180.0) if units.lower().startswith("deg") else values
+
+        face_lon   = _to_radians(ds["grid_center_lon"])
+        face_lat   = _to_radians(ds["grid_center_lat"])
+        corner_lon = _to_radians(ds["grid_corner_lon"])
+        corner_lat = _to_radians(ds["grid_corner_lat"])
+        area       = ds["grid_area"].values * _R_EARTH**2
+        mask       = ds["grid_imask"].values
+
+        face_corner_lon = []
+        face_corner_lat = []
+        for lons, lats in zip(corner_lon, corner_lat):
+            n = len(lons)
+            while n > 3 and abs(lons[n-1] - lons[n-2]) < node_atol and abs(lats[n-1] - lats[n-2]) < node_atol:
+                n -= 1
+            face_corner_lon.append(lons[:n])
+            face_corner_lat.append(lats[:n])
+
+        attrs = {}
+        if ds.attrs.get("title"):
+            attrs["title"] = ds.attrs["title"]
+
+        return cls.from_polygons(
+            face_corner_lon = face_corner_lon,
+            face_corner_lat = face_corner_lat,
+            face_lon        = face_lon,
+            face_lat        = face_lat,
+            area            = area,
+            mask            = mask,
+            attrs           = attrs,
+            node_atol       = node_atol,
+        )
+
 
 def apply_ocean_mask(mesh: UnstructuredGridMesh) -> UnstructuredGridMesh:
     """
