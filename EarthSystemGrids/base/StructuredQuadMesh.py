@@ -136,6 +136,73 @@ class StructuredQuadMesh(UnstructuredGridMesh):
         ds.to_netcdf(output_file)
 
     @classmethod
+    def from_SCRIP_file(cls, input_file):
+        """
+        Load a StructuredQuadMesh back from a file written by
+        write_to_SCRIP_grid_file.
+
+        Round-trip counterpart to that writer, not a general SCRIP reader:
+        it assumes grid_dims = [ni, nj] (ESMF's reversed order -- see the
+        writer's docstring) and SW/SE/NE/NW corner ordering per face, the
+        same assumptions _build_topology_2d makes when from_corners (below)
+        hands it these corner arrays. A SCRIP file from another tool, with
+        a different corner winding or grid_rank, will load without error
+        but build a mesh with scrambled topology.
+
+        Both of the writer's two layouts -- flattened (grid_size, degrees)
+        and unflattened ((lat, lon), radians) -- reshape to the same
+        (nj, ni, ...) arrays via a plain `.reshape`, since both already lay
+        their data out row-major over (j, i); no explicit branch on layout
+        is needed. Units are read from each variable's own `units`
+        attribute rather than assumed from the layout.
+
+        grid_area is converted back from steradians (grid_area * R_EARTH**2)
+        to match `.area`'s m² convention. grid_angle / grid_cos_angle /
+        grid_sin_angle are not read even if present -- like every
+        `extra_variables` field, the rotation angle is recomputed from
+        geometry by StructuredQuadMesh._compute_extra_variables, not
+        trusted from the file.
+        """
+        ds = xr.open_dataset(input_file, mask_and_scale=False)
+
+        ni, nj = (int(n) for n in ds["grid_dims"].values)
+        shape  = (nj, ni)
+
+        grid_corners = ds.sizes.get("grid_corners")
+        if grid_corners != cls.n_corners:
+            raise ValueError(
+                f"{input_file!r} has grid_corners={grid_corners}, not "
+                f"{cls.n_corners} -- not a uniform quadrilateral SCRIP grid."
+            )
+
+        def _to_radians(da):
+            units = da.attrs.get("units", "radians")
+            values = da.values
+            return values * (np.pi / 180.0) if units.lower().startswith("deg") else values
+
+        face_lon   = _to_radians(ds["grid_center_lon"]).reshape(shape)
+        face_lat   = _to_radians(ds["grid_center_lat"]).reshape(shape)
+        corner_lon = _to_radians(ds["grid_corner_lon"]).reshape(*shape, grid_corners)
+        corner_lat = _to_radians(ds["grid_corner_lat"]).reshape(*shape, grid_corners)
+        area       = ds["grid_area"].values.reshape(shape) * _R_EARTH**2
+        mask       = ds["grid_imask"].values.reshape(shape)
+
+        attrs = {}
+        if ds.attrs.get("title"):
+            attrs["title"] = ds.attrs["title"]
+
+        return cls.from_corners(
+            corner_lon = corner_lon,
+            corner_lat = corner_lat,
+            face_lon   = face_lon,
+            face_lat   = face_lat,
+            area       = area,
+            mask       = mask,
+            shape      = shape,
+            attrs      = attrs,
+        )
+
+    @classmethod
     def from_CF_file(cls, input_file):
         """
         Load a StructuredQuadMesh back from a file written by
