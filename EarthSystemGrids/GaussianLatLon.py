@@ -20,13 +20,28 @@ def gaussian_latitudes(nlat: int):
     return np.rad2deg(np.arcsin(x))
 
 
-def equally_spaced_centers(n: int, lo: float, hi: float):
-    """n cell-centre values evenly spaced over [lo, hi] (same units as lo/hi)."""
-    bounds = np.linspace(lo, hi, n + 1)
-    return 0.5 * (bounds[:-1] + bounds[1:])
+def gaussian_latitude_bounds(nlat: int):
+    """
+    nlat+1 latitude cell-FACE values, degrees, ascending: the boundaries
+    bisecting between the nlat Gaussian quadrature latitudes (see
+    `gaussian_latitudes`), with the outer two bounds clamped to the poles.
+
+    A symmetric extrapolation of the outermost gap falls short of the true
+    pole for a Gaussian grid (more so at low resolution), which would
+    leave the polar cap uncovered by any cell -- so the poles are used
+    directly instead.
+    """
+    centers = np.deg2rad(gaussian_latitudes(nlat))
+    bounds = bounds_from_centers(centers, clamp=(-np.pi/2, np.pi/2))
+    return np.rad2deg(bounds)
 
 
-def _bounds_from_centers(centers, clamp=None):
+def equally_spaced_bounds(n: int, lo: float, hi: float):
+    """n+1 evenly spaced cell-FACE values over [lo, hi] (same units as lo/hi)."""
+    return np.linspace(lo, hi, n + 1)
+
+
+def bounds_from_centers(centers, clamp=None):
     """
     Cell-edge values bisecting between consecutive centres, for any
     monotonically increasing centres -- evenly spaced or not, Gaussian or
@@ -34,7 +49,14 @@ def _bounds_from_centers(centers, clamp=None):
     outermost gap, unless `clamp` gives an explicit (lo, hi) to use
     instead -- needed for latitude, where the physical boundary is the
     pole, not whatever a symmetric extrapolation happens to land on.
+
+    Exposed publicly (not module-private) so a caller who already has its
+    own set of cell centres -- e.g. JCMGrid, which gets its centres
+    straight from the spectral model's own Gaussian grid rather than
+    computing them here -- can derive the matching face boundaries before
+    calling `generate_mesh`, which itself takes faces, not centres.
     """
+    centers = np.asarray(centers, dtype=float)
     midpoints = 0.5 * (centers[1:] + centers[:-1])
     if clamp is not None:
         lo, hi = clamp
@@ -47,22 +69,22 @@ def _bounds_from_centers(centers, clamp=None):
 def generate_mesh(lat, lon, mask=None, earth_radius: float = _R_EARTH,
                   attrs=None) -> StructuredQuadMesh:
     """
-    Build a lat-lon StructuredQuadMesh. Latitude and longitude are each
-    independently either evenly or unevenly spaced -- "Gaussian lat-lon"
-    (non-uniform latitude, uniform longitude) is the default when `lat`
-    and `lon` are given as plain counts, but either axis accepts an
-    explicit centre array instead, evenly spaced or not.
+    Build a lat-lon StructuredQuadMesh from explicit cell-FACE (boundary)
+    arrays for each axis -- faces are the primitive input, not centres.
+    Latitude and longitude are each independently either evenly or
+    unevenly spaced: "Gaussian lat-lon" (non-uniform latitude, uniform
+    longitude) is the standard combination, obtained by passing
+    `gaussian_latitude_bounds(nlat)` and `equally_spaced_bounds(nlon, 0,
+    360)`, but any monotonically increasing boundary set works on either
+    axis.
 
     Parameters
     ----------
-    lat : int, or array-like of latitude CENTRES in degrees (ascending)
-        An int nlat requests the standard Gaussian-grid latitudes (see
-        `gaussian_latitudes`). An explicit array is used as-is -- evenly
-        spaced or not, it makes no difference to how the mesh is built.
-    lon : int, or array-like of longitude CENTRES in degrees (ascending)
-        An int nlon requests nlon evenly-spaced centres spanning the full
-        periodic 360 deg, the standard longitude spacing of every
-        Gaussian-grid convention. An explicit array is used as-is.
+    lat : array-like of nlat+1 latitude FACE values in degrees (ascending).
+        See `gaussian_latitude_bounds` for the standard Gaussian-grid
+        spacing, or supply any other monotonically increasing boundary set.
+    lon : array-like of nlon+1 longitude FACE values in degrees (ascending).
+        See `equally_spaced_bounds` for the standard uniform spacing.
     mask : (nlat, nlon) int, optional. 0=land 1=ocean. Defaults to all
         ocean; see EarthSystemGrids.base.apply_ocean_mask to fill this in
         from a coastline afterwards.
@@ -74,20 +96,14 @@ def generate_mesh(lat, lon, mask=None, earth_radius: float = _R_EARTH,
     -------
     StructuredQuadMesh, shape (nlat, nlon)
     """
-    lat_centers_deg = (gaussian_latitudes(lat) if isinstance(lat, (int, np.integer))
-                       else np.asarray(lat, dtype=float))
-    lon_centers_deg = (equally_spaced_centers(lon, 0.0, 360.0) if isinstance(lon, (int, np.integer))
-                       else np.asarray(lon, dtype=float))
+    lat_bounds = np.deg2rad(np.asarray(lat, dtype=float))
+    lon_bounds = np.deg2rad(np.asarray(lon, dtype=float))
+    nlat, nlon = lat_bounds.size - 1, lon_bounds.size - 1
 
-    lat_centers = np.deg2rad(lat_centers_deg)
-    lon_centers = np.deg2rad(lon_centers_deg)
-    nlat, nlon = lat_centers.size, lon_centers.size
-
-    # pole-clamped: a symmetric extrapolation of the outermost gap falls
-    # short of the true pole for a Gaussian grid (more so at low
-    # resolution), leaving the polar cap uncovered by any cell.
-    lat_bounds = _bounds_from_centers(lat_centers, clamp=(-np.pi/2, np.pi/2))
-    lon_bounds = _bounds_from_centers(lon_centers)
+    # centres are the plain angular midpoint of each pair of adjacent
+    # faces -- derived from the faces, not the other way around
+    lat_centers = 0.5 * (lat_bounds[:-1] + lat_bounds[1:])
+    lon_centers = 0.5 * (lon_bounds[:-1] + lon_bounds[1:])
 
     face_lon, face_lat = np.meshgrid(lon_centers, lat_centers)   # each (nlat, nlon)
 

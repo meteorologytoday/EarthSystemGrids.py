@@ -64,10 +64,11 @@ mesh.write_to_SCRIP_grid_file('${jcm_scrip}', flatten=True)
 
 echo "Generating rotated Gaussian lat-lon grid SCRIP file ..."
 python3 -c "
+from EarthSystemGrids.GaussianLatLon import gaussian_latitude_bounds, equally_spaced_bounds
 from EarthSystemGrids.RotatedGaussianLatLon import RotatedGaussianLatLon
 mesh = RotatedGaussianLatLon.generate_mesh(
-    lat=${RGLL_NLAT},
-    lon=${RGLL_NLON},
+    lat=gaussian_latitude_bounds(${RGLL_NLAT}),
+    lon=equally_spaced_bounds(${RGLL_NLON}, 0.0, 360.0),
     rotation_axis_longitude_deg=${RGLL_ROTATION_AXIS_LONGITUDE_DEG},
     rotation_deg=${RGLL_ROTATION_DEG},
 )

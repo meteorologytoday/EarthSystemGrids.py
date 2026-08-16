@@ -78,8 +78,10 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
 
         Parameters
         ----------
-        lat, lon : as GaussianLatLon.generate_mesh -- int count or explicit
-            centre array, in the grid's own native (unrotated) frame.
+        lat, lon : as GaussianLatLon.generate_mesh -- explicit cell-FACE
+            (boundary) arrays, in the grid's own native (unrotated) frame.
+            See GaussianLatLon.gaussian_latitude_bounds / equally_spaced_bounds
+            for the standard Gaussian-grid spacing.
         rotation_axis_longitude_deg : degrees. Longitude, in the equatorial
             plane, of the axis the whole grid is rotated about.
         rotation_deg : degrees. Rotation angle about that axis (right-hand

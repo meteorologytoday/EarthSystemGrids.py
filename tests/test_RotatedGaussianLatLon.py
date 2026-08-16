@@ -3,11 +3,14 @@ import numpy as np
 from EarthSystemGrids import GaussianLatLon
 from EarthSystemGrids.RotatedGaussianLatLon import RotatedGaussianLatLon
 
+_LAT_BOUNDS = GaussianLatLon.gaussian_latitude_bounds(8)
+_LON_BOUNDS = GaussianLatLon.equally_spaced_bounds(12, 0.0, 360.0)
+
 
 def test_generate_mesh_area_and_shape_preserved():
-    base_mesh = GaussianLatLon.generate_mesh(lat=8, lon=12)
+    base_mesh = GaussianLatLon.generate_mesh(lat=_LAT_BOUNDS, lon=_LON_BOUNDS)
     rotated_mesh = RotatedGaussianLatLon.generate_mesh(
-        lat=8, lon=12, rotation_axis_longitude_deg=48.0, rotation_deg=12.0,
+        lat=_LAT_BOUNDS, lon=_LON_BOUNDS, rotation_axis_longitude_deg=48.0, rotation_deg=12.0,
     )
 
     assert rotated_mesh.shape == base_mesh.shape
@@ -21,7 +24,7 @@ def test_generate_mesh_SCRIP_round_trip(tmp_path):
     from EarthSystemGrids.base import StructuredQuadMesh
 
     mesh = RotatedGaussianLatLon.generate_mesh(
-        lat=8, lon=12, rotation_axis_longitude_deg=-42.0 + 90.0, rotation_deg=12.0,
+        lat=_LAT_BOUNDS, lon=_LON_BOUNDS, rotation_axis_longitude_deg=-42.0 + 90.0, rotation_deg=12.0,
         attrs={"title": "rotated test grid"},
     )
 
@@ -39,9 +42,9 @@ def test_generate_mesh_SCRIP_round_trip(tmp_path):
 
 
 def test_native_axes_match_unrotated_gaussian_grid():
-    base_mesh = GaussianLatLon.generate_mesh(lat=8, lon=12)
+    base_mesh = GaussianLatLon.generate_mesh(lat=_LAT_BOUNDS, lon=_LON_BOUNDS)
     rotated_mesh = RotatedGaussianLatLon.generate_mesh(
-        lat=8, lon=12, rotation_axis_longitude_deg=48.0, rotation_deg=12.0,
+        lat=_LAT_BOUNDS, lon=_LON_BOUNDS, rotation_axis_longitude_deg=48.0, rotation_deg=12.0,
     )
 
     nlat, nlon = base_mesh.shape
@@ -56,7 +59,7 @@ def test_native_axes_match_unrotated_gaussian_grid():
 
 def test_native_axes_survive_SCRIP_round_trip(tmp_path):
     mesh = RotatedGaussianLatLon.generate_mesh(
-        lat=8, lon=12, rotation_axis_longitude_deg=48.0, rotation_deg=12.0,
+        lat=_LAT_BOUNDS, lon=_LON_BOUNDS, rotation_axis_longitude_deg=48.0, rotation_deg=12.0,
         attrs={"title": "rotated test grid"},
     )
 

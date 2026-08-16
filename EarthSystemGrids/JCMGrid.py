@@ -35,12 +35,15 @@ def generate_JCMGrid(resolution: int, mask=None, earth_radius: float = _R_EARTH,
     """
     Build the JCM spectral-truncation grid as a StructuredQuadMesh.
 
-    Delegates the actual mesh construction to GaussianLatLon.generate_mesh,
-    passing jcm's own native grid centres (Gaussian latitudes, uniformly
-    spaced longitudes) as explicit degree arrays rather than regenerating
-    them independently -- this keeps the mesh tied to the exact values the
-    model itself uses (see _horizontal_grid_for_resolution), not values
-    that merely ought to equal them.
+    GaussianLatLon.generate_mesh takes cell FACES, not centres, so jcm's
+    own native grid centres (Gaussian latitudes, uniformly spaced
+    longitudes) are first bisected into face boundaries here via
+    GaussianLatLon.bounds_from_centers -- the same bisection
+    generate_mesh used to do internally before it became face-driven --
+    rather than regenerating the centres independently. This keeps the
+    mesh tied to the exact values the model itself uses (see
+    _horizontal_grid_for_resolution), not values that merely ought to
+    equal them.
 
     Parameters
     ----------
@@ -54,15 +57,22 @@ def generate_JCMGrid(resolution: int, mask=None, earth_radius: float = _R_EARTH,
     StructuredQuadMesh, shape (nlat, nlon)
     """
     horizontal_grid = _horizontal_grid_for_resolution(resolution)
-    lat_centers_deg = np.rad2deg(np.asarray(horizontal_grid.latitudes))
-    lon_centers_deg = np.rad2deg(np.asarray(horizontal_grid.longitudes))
+    lat_centers = np.asarray(horizontal_grid.latitudes)   # radians
+    lon_centers = np.asarray(horizontal_grid.longitudes)  # radians
+
+    # pole-clamped for latitude, same reasoning as
+    # GaussianLatLon.gaussian_latitude_bounds: a symmetric extrapolation
+    # of the outermost gap falls short of the true pole
+    lat_bounds_deg = np.rad2deg(
+        GaussianLatLon.bounds_from_centers(lat_centers, clamp=(-np.pi/2, np.pi/2)))
+    lon_bounds_deg = np.rad2deg(GaussianLatLon.bounds_from_centers(lon_centers))
 
     grid_attrs = {"title": f"JCM T{resolution} spectral-truncation grid"}
     grid_attrs.update(attrs or {})
 
     return GaussianLatLon.generate_mesh(
-        lat          = lat_centers_deg,
-        lon          = lon_centers_deg,
+        lat          = lat_bounds_deg,
+        lon          = lon_bounds_deg,
         mask         = mask,
         earth_radius = earth_radius,
         attrs        = grid_attrs,
