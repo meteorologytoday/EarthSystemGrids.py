@@ -19,10 +19,13 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
     In addition to everything StructuredQuadMesh stores, this class keeps
     the grid's native (pre-rotation) 1D cell-centre axes --
     native_lat_deg (nlat,) and native_lon_deg (nlon,), degrees -- as
-    `.native_lat_deg` / `.native_lon_deg`. A plain Gaussian lat-lon grid
-    is a graticule: every row shares one set of longitudes and every
-    column shares one set of latitudes, so these are read off directly,
-    before rotation, rather than recomputed. Unlike the rotation angle
+    `.native_lat_deg` / `.native_lon_deg`, plus the cell-FACE (boundary)
+    axes they were derived from -- native_lat_bounds_deg (nlat+1,) and
+    native_lon_bounds_deg (nlon+1,) -- as `.native_lat_bounds_deg` /
+    `.native_lon_bounds_deg`. A plain Gaussian lat-lon grid is a
+    graticule: every row shares one set of longitudes and every column
+    shares one set of latitudes, so these are read off directly, before
+    rotation, rather than recomputed. Unlike the rotation angle
     (StructuredQuadMesh's extra variable, re-derivable from the rotated
     mesh's own geometry), the native axes are NOT recoverable from the
     rotated face_lon/face_lat alone -- rotation destroys that information
@@ -31,13 +34,16 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
     """
 
     # Class-level defaults so every method below can read
-    # self.native_lat_deg / self.native_lon_deg unconditionally, without a
+    # self.native_lat_deg / self.native_lon_deg / self.native_lat_bounds_deg
+    # / self.native_lon_bounds_deg unconditionally, without a
     # getattr(..., None) guard: a bare/partially-constructed instance
     # (e.g. mid-from_corners, before generate_mesh/from_SCRIP_file/
     # from_CF_file has had a chance to attach the real arrays) simply
     # sees None here.
     native_lat_deg = None
     native_lon_deg = None
+    native_lat_bounds_deg = None
+    native_lon_bounds_deg = None
 
     @classmethod
     def generate_mesh(cls, lat, lon, rotation_axis_longitude_deg, rotation_deg,
@@ -67,7 +73,9 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
         The native (pre-rotation) 1D centre axes are captured from the
         unrotated intermediate arrays, before rotate_lonlat overwrites
         them, and attached to the returned mesh as .native_lat_deg /
-        .native_lon_deg (also exposed as the native_lat / native_lon
+        .native_lon_deg, alongside the input face arrays themselves as
+        .native_lat_bounds_deg / .native_lon_bounds_deg (also exposed as
+        the native_lat / native_lon / native_lat_bounds / native_lon_bounds
         extra variables -- see _compute_extra_variables).
 
         mask defaults to all-ocean, same convention as
@@ -112,6 +120,12 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
         native_lat_deg = np.rad2deg(face_lat[:, 0]).copy()
         native_lon_deg = np.rad2deg(face_lon[0, :]).copy()
 
+        # The face (boundary) arrays are exactly the lat/lon arguments
+        # this method was called with -- generate_mesh takes faces, not
+        # centres, so no separate derivation is needed here.
+        native_lat_bounds_deg = np.asarray(lat, dtype=float).copy()
+        native_lon_bounds_deg = np.asarray(lon, dtype=float).copy()
+
         corner_lon, corner_lat = rotate_lonlat(
             corner_lon, corner_lat, rotation_axis_longitude_deg, rotation_deg)
         face_lon, face_lat = rotate_lonlat(
@@ -142,14 +156,17 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
         # rotation_angle().
         mesh.native_lat_deg = native_lat_deg
         mesh.native_lon_deg = native_lon_deg
+        mesh.native_lat_bounds_deg = native_lat_bounds_deg
+        mesh.native_lon_bounds_deg = native_lon_bounds_deg
         mesh.extra_variables = mesh._compute_extra_variables()
 
         return mesh
 
     def _native_axis_variables(self):
         """
-        {name: xr.DataArray} for native_lat/native_lon, or {} if this
-        instance doesn't have them yet (e.g. built by a generic
+        {name: xr.DataArray} for native_lat/native_lon and, if present,
+        native_lat_bounds/native_lon_bounds, or {} if this instance
+        doesn't have the centre axes yet (e.g. built by a generic
         from_corners call rather than generate_mesh/from_SCRIP_file/
         from_CF_file). Single source of truth for both
         _compute_extra_variables (feeds the CF writer) and
@@ -158,7 +175,7 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
         """
         if self.native_lat_deg is None or self.native_lon_deg is None:
             return {}
-        return {
+        variables = {
             "native_lat": xr.DataArray(
                 self.native_lat_deg, dims=["native_lat"],
                 attrs={
@@ -178,6 +195,27 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
                 },
             ),
         }
+        if self.native_lat_bounds_deg is not None:
+            variables["native_lat_bounds"] = xr.DataArray(
+                self.native_lat_bounds_deg, dims=["native_lat_bounds"],
+                attrs={
+                    "standard_name": "latitude",
+                    "units": "degrees_north",
+                    "long_name": "cell-face latitude on the grid's "
+                                  "native (pre-rotation) Gaussian lat-lon axis",
+                },
+            )
+        if self.native_lon_bounds_deg is not None:
+            variables["native_lon_bounds"] = xr.DataArray(
+                self.native_lon_bounds_deg, dims=["native_lon_bounds"],
+                attrs={
+                    "standard_name": "longitude",
+                    "units": "degrees_east",
+                    "long_name": "cell-face longitude on the grid's "
+                                  "native (pre-rotation) Gaussian lat-lon axis",
+                },
+            )
+        return variables
 
     def _compute_extra_variables(self):
         """
@@ -195,9 +233,10 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
     def write_to_SCRIP_grid_file(self, output_file, flatten: bool = True):
         """
         Writes exactly what StructuredQuadMesh.write_to_SCRIP_grid_file
-        writes (via super()), then adds native_lat (nlat,) / native_lon
-        (nlon,) on top, under their own dedicated native_lat/native_lon
-        dimensions -- independent of `flatten`, so the extension schema
+        writes (via super()), then adds native_lat/native_lon (cell
+        centres, nlat/nlon) and native_lat_bounds/native_lon_bounds (cell
+        faces, nlat+1/nlon+1) on top, each under its own dedicated
+        dimension -- independent of `flatten`, so the extension schema
         doesn't change shape depending on that flag, and from_SCRIP_file
         below has one reader path for both. ESMF_RegridWeightGen/ncremap
         ignore variables they don't recognise, so this stays a valid
@@ -205,8 +244,8 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
 
         The parent writer builds and writes its xr.Dataset in one step
         and returns None, so it can't be intercepted before write; the
-        two extra variables are added by reading the just-written file
-        back in fully, merging, and rewriting once.
+        extra variables are added by reading the just-written file back
+        in fully, merging, and rewriting once.
         """
         super().write_to_SCRIP_grid_file(output_file, flatten=flatten)
 
@@ -219,21 +258,35 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
         ds.update(extra)
         ds.to_netcdf(output_file)
 
+    @staticmethod
+    def _restore_native_axes(mesh, ds):
+        """
+        Read native_lat/native_lon and, if present, native_lat_bounds/
+        native_lon_bounds back from an already-open dataset onto mesh,
+        then recompute mesh.extra_variables so they show up there too.
+        Shared by from_SCRIP_file and from_CF_file below.
+        """
+        if "native_lat" in ds.variables and "native_lon" in ds.variables:
+            mesh.native_lat_deg = ds["native_lat"].values.copy()
+            mesh.native_lon_deg = ds["native_lon"].values.copy()
+        if "native_lat_bounds" in ds.variables and "native_lon_bounds" in ds.variables:
+            mesh.native_lat_bounds_deg = ds["native_lat_bounds"].values.copy()
+            mesh.native_lon_bounds_deg = ds["native_lon_bounds"].values.copy()
+        mesh.extra_variables = mesh._compute_extra_variables()
+        return mesh
+
     @classmethod
     def from_SCRIP_file(cls, input_file):
         """
         super().from_SCRIP_file (StructuredQuadMesh's) builds the mesh via
         from_corners, same as any other structured quad grid; this then
-        separately restores native_lat/native_lon if present (they won't
-        be, for a SCRIP file this class didn't write itself), and
-        recomputes extra_variables so they show up in .extra_variables too.
+        separately restores the native axes if present (they won't be,
+        for a SCRIP file this class didn't write itself) via
+        _restore_native_axes.
         """
         mesh = super().from_SCRIP_file(input_file)
         with xr.open_dataset(input_file, mask_and_scale=False) as ds:
-            if "native_lat" in ds.variables and "native_lon" in ds.variables:
-                mesh.native_lat_deg = ds["native_lat"].values.copy()
-                mesh.native_lon_deg = ds["native_lon"].values.copy()
-        mesh.extra_variables = mesh._compute_extra_variables()
+            cls._restore_native_axes(mesh, ds)
         return mesh
 
     @classmethod
@@ -243,15 +296,12 @@ class RotatedGaussianLatLon(StructuredQuadMesh):
         the one place in this class that deliberately departs from the
         base classes' "never trust extra_variables from the file, always
         recompute from geometry" rule (see
-        UnstructuredGridMesh._compute_extra_variables): native_lat/
-        native_lon cannot be re-derived from the rotated face_lon/lat
-        alone -- rotation is lossy -- so they are read back from the file
-        rather than recomputed.
+        UnstructuredGridMesh._compute_extra_variables): the native axes
+        cannot be re-derived from the rotated face_lon/lat alone --
+        rotation is lossy -- so they are read back from the file rather
+        than recomputed.
         """
         mesh = super().from_CF_file(input_file)
         with xr.open_dataset(input_file, mask_and_scale=False) as ds:
-            if "native_lat" in ds.variables and "native_lon" in ds.variables:
-                mesh.native_lat_deg = ds["native_lat"].values.copy()
-                mesh.native_lon_deg = ds["native_lon"].values.copy()
-        mesh.extra_variables = mesh._compute_extra_variables()
+            cls._restore_native_axes(mesh, ds)
         return mesh

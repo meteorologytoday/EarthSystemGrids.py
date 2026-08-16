@@ -53,8 +53,12 @@ def test_native_axes_match_unrotated_gaussian_grid():
 
     np.testing.assert_allclose(rotated_mesh.native_lat_deg, expected_lat_deg, atol=1e-10)
     np.testing.assert_allclose(rotated_mesh.native_lon_deg, expected_lon_deg, atol=1e-10)
+    np.testing.assert_allclose(rotated_mesh.native_lat_bounds_deg, _LAT_BOUNDS, atol=1e-10)
+    np.testing.assert_allclose(rotated_mesh.native_lon_bounds_deg, _LON_BOUNDS, atol=1e-10)
     assert "native_lat" in rotated_mesh.extra_variables
     assert "native_lon" in rotated_mesh.extra_variables
+    assert "native_lat_bounds" in rotated_mesh.extra_variables
+    assert "native_lon_bounds" in rotated_mesh.extra_variables
 
 
 def test_native_axes_survive_SCRIP_round_trip(tmp_path):
@@ -69,4 +73,6 @@ def test_native_axes_survive_SCRIP_round_trip(tmp_path):
 
     np.testing.assert_allclose(loaded.native_lat_deg, mesh.native_lat_deg, atol=1e-10)
     np.testing.assert_allclose(loaded.native_lon_deg, mesh.native_lon_deg, atol=1e-10)
+    np.testing.assert_allclose(loaded.native_lat_bounds_deg, mesh.native_lat_bounds_deg, atol=1e-10)
+    np.testing.assert_allclose(loaded.native_lon_bounds_deg, mesh.native_lon_bounds_deg, atol=1e-10)
     assert loaded.attrs.get("title") == "rotated test grid"
