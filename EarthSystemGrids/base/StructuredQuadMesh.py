@@ -5,6 +5,28 @@ from EarthSystemGrids.base.UnstructuredGridMesh import (
     UnstructuredGridMesh, _great_circle_lengths, _FACE_ATTRS, _R_EARTH,
 )
 
+_VECTOR_ROTATION_COMMENT = (
+    "'angle' is the angle (radians, positive anticlockwise) from true east "
+    "to the grid's local i-direction at each cell centre; 'cos_angle' / "
+    "'sin_angle' are its cosine/sine, provided so consumers don't have to "
+    "re-derive them (named grid_angle/grid_cos_angle/grid_sin_angle in the "
+    "SCRIP writer, angle/cos_angle/sin_angle in the CF writer). To rotate "
+    "a vector with grid-relative components (u_grid along i, v_grid along "
+    "j) into geographic east/north components: "
+    "u_east = u_grid*cos_angle - v_grid*sin_angle; "
+    "v_north = u_grid*sin_angle + v_grid*cos_angle. "
+    "To go the other way, east/north into grid-relative: "
+    "u_grid = u_east*cos_angle + v_north*sin_angle; "
+    "v_grid = -u_east*sin_angle + v_north*cos_angle."
+)
+
+_ANGLE_ATTRS = {
+    "long_name": "angle of rotation from true east to grid i-direction",
+    "comment": _VECTOR_ROTATION_COMMENT,
+}
+_COS_ANGLE_ATTRS = {"long_name": "cosine of grid rotation angle"}
+_SIN_ANGLE_ATTRS = {"long_name": "sine of grid rotation angle"}
+
 
 class StructuredQuadMesh(UnstructuredGridMesh):
     """
@@ -111,9 +133,9 @@ class StructuredQuadMesh(UnstructuredGridMesh):
                     grid_corner_lat = (["grid_size", "grid_corners"],  corner_lat    * rad2deg, {"units": "degrees"}),
                     grid_corner_lon = (["grid_size", "grid_corners"],  corner_lon    * rad2deg, {"units": "degrees"}),
                     grid_area       = (["grid_size"],                  area_sr,                 {"units": "radians^2"}),
-                    grid_angle      = (["grid_size"],                  angle,                   {"units": "radians"}),
-                    grid_cos_angle  = (["grid_size"],                  cos_angle,               {"units": "1"}),
-                    grid_sin_angle  = (["grid_size"],                  sin_angle,               {"units": "1"}),
+                    grid_angle      = (["grid_size"],                  angle,                   {"units": "radians", **_ANGLE_ATTRS}),
+                    grid_cos_angle  = (["grid_size"],                  cos_angle,               {"units": "1", **_COS_ANGLE_ATTRS}),
+                    grid_sin_angle  = (["grid_size"],                  sin_angle,               {"units": "1", **_SIN_ANGLE_ATTRS}),
                 ),
             )
         else:
@@ -126,13 +148,14 @@ class StructuredQuadMesh(UnstructuredGridMesh):
                     grid_corner_lat = ([*grid_dim_names, "grid_corners"],          corner_lat.reshape(*self.shape, grid_corners),   {"units": "radians"}),
                     grid_corner_lon = ([*grid_dim_names, "grid_corners"],          corner_lon.reshape(*self.shape, grid_corners),   {"units": "radians"}),
                     grid_area       = ([*grid_dim_names],                          area_sr.reshape(self.shape),     {"units": "radians^2"}),
-                    grid_angle      = ([*grid_dim_names],                          angle.reshape(self.shape),       {"units": "radians"}),
-                    grid_cos_angle  = ([*grid_dim_names],                          cos_angle.reshape(self.shape),   {"units": "1"}),
-                    grid_sin_angle  = ([*grid_dim_names],                          sin_angle.reshape(self.shape),   {"units": "1"}),
+                    grid_angle      = ([*grid_dim_names],                          angle.reshape(self.shape),       {"units": "radians", **_ANGLE_ATTRS}),
+                    grid_cos_angle  = ([*grid_dim_names],                          cos_angle.reshape(self.shape),   {"units": "1", **_COS_ANGLE_ATTRS}),
+                    grid_sin_angle  = ([*grid_dim_names],                          sin_angle.reshape(self.shape),   {"units": "1", **_SIN_ANGLE_ATTRS}),
                 ),
             )
 
         ds.attrs["title"] = self.attrs.get("title", "")
+        ds.attrs["comment"] = _VECTOR_ROTATION_COMMENT
         ds.to_netcdf(output_file)
 
     @classmethod
@@ -291,16 +314,17 @@ class StructuredQuadMesh(UnstructuredGridMesh):
                 attrs={
                     "standard_name": "angle_of_rotation_from_east_to_x",
                     "units": "radian",
+                    **_ANGLE_ATTRS,
                     **_FACE_ATTRS,
                 },
             ),
             "cos_angle": xr.DataArray(
                 np.cos(angle), dims=["nface"],
-                attrs={"long_name": "cosine of grid rotation angle", "units": "1", **_FACE_ATTRS},
+                attrs={"units": "1", **_COS_ANGLE_ATTRS, **_FACE_ATTRS},
             ),
             "sin_angle": xr.DataArray(
                 np.sin(angle), dims=["nface"],
-                attrs={"long_name": "sine of grid rotation angle", "units": "1", **_FACE_ATTRS},
+                attrs={"units": "1", **_SIN_ANGLE_ATTRS, **_FACE_ATTRS},
             ),
         }
 
