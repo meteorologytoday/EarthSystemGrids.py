@@ -1,8 +1,10 @@
 #!/bin/bash
 #
-# 1. Regrid the ERA5 land-sea mask onto the JCM grid and the rotated
-#    Gaussian lat-lon grid, conservatively (area-weighted), via NCO's
-#    ncremap.
+# 1. Regrid the ERA5 land-sea mask and geopotential onto the JCM grid and
+#    the rotated Gaussian lat-lon grid, conservatively (area-weighted), via
+#    NCO's ncremap -- both variables in the same ncremap call, so they land
+#    in the same output file per grid. The geopotential is then converted
+#    to topography (surface altitude) in place, by dividing by gravity.
 # 2. Generate reusable ESMF regridding weight files directly between the
 #    JCM grid and the rotated Gaussian lat-lon grid (no ERA5 involved), for
 #    both mapping directions and both bilinear and conservative methods.
@@ -13,6 +15,11 @@
 # source grid from ERA5_landsea_mask.nc's own lat/lon coordinates; only the
 # two destination grids need an explicit SCRIP file, generated below from
 # this repo's own grid code.
+#
+# ERA5's `z` variable is geopotential (m2 s-2), not elevation. Conservative
+# remapping is linear, so it commutes with the division by gravity -- the
+# script remaps `z` first and divides afterward, rather than dividing ERA5
+# `z` upfront, for exactly the same result with one fewer intermediate file.
 #
 # The JCM<->rotated-Gaussian weight files ignore masking entirely -- every
 # cell on both grids is treated as valid. This holds by construction, not
@@ -26,9 +33,11 @@ set -euo pipefail
 set -x
 
 # --- inputs you may want to change ------------------------------------------
-ERA5_FILE=ERA5_landsea_mask.nc     # must have variable "lsm" on lat/lon
+ERA5_FILE=ERA5_landsea_mask.nc     # must have variables "lsm" and "z" on lat/lon
 OUTPUT_DIR=landsea_mask_data
 GRID_DIR=grid_data
+
+GRAVITY=9.80665                    # m s-2, standard gravity (ERA5 convention: elevation = z / GRAVITY)
 
 JCM_RESOLUTION=31                  # spectral truncation, e.g. 31 -> T31
 
@@ -75,21 +84,48 @@ mesh = RotatedGaussianLatLon.generate_mesh(
 mesh.write_to_SCRIP_grid_file('${rgll_scrip}', flatten=True)
 "
 
-echo "Remapping ERA5 land-sea mask onto the JCM grid ..."
+landsea_jcm="${OUTPUT_DIR}/landsea_mask_fraction_JCM_T${JCM_RESOLUTION}.nc"
+landsea_rgll="${OUTPUT_DIR}/landsea_mask_fraction_RotatedGaussianLatLon.nc"
+
+echo "Remapping ERA5 land-sea mask and geopotential onto the JCM grid ..."
 ncremap -a "${REMAP_ALGORITHM}" \
     -g "${jcm_scrip}" \
     -i "${ERA5_FILE}" \
-    -v lsm \
-    -o "${OUTPUT_DIR}/landsea_mask_fraction_JCM_T${JCM_RESOLUTION}.nc"
+    -v lsm,z \
+    -o "${landsea_jcm}"
 
-echo "Remapping ERA5 land-sea mask onto the rotated Gaussian lat-lon grid ..."
+echo "Remapping ERA5 land-sea mask and geopotential onto the rotated Gaussian lat-lon grid ..."
 ncremap -a "${REMAP_ALGORITHM}" \
     -g "${rgll_scrip}" \
     -i "${ERA5_FILE}" \
-    -v lsm \
-    -o "${OUTPUT_DIR}/landsea_mask_fraction_RotatedGaussianLatLon.nc"
+    -v lsm,z \
+    -o "${landsea_rgll}"
 
-echo "Done. Fractional masks written to ${OUTPUT_DIR}/"
+echo "Converting remapped geopotential to topography (z / gravity) ..."
+python3 -c "
+import xarray as xr
+
+GRAVITY = ${GRAVITY}
+
+for path in ['${landsea_jcm}', '${landsea_rgll}']:
+    # Load fully and close before overwriting -- xarray's netCDF4 backend
+    # keeps the file open lazily otherwise, and writing back to a path it
+    # still has open corrupts the file.
+    ds = xr.open_dataset(path).load()
+    ds.close()
+
+    topography = ds['z'] / GRAVITY
+    topography.attrs = {
+        'standard_name': 'surface_altitude',
+        'long_name': 'surface altitude (ERA5 geopotential / gravity)',
+        'units': 'm',
+    }
+    ds = ds.drop_vars('z')
+    ds['topography'] = topography
+    ds.to_netcdf(path)
+"
+
+echo "Done. Fractional land-sea mask and topography written to ${OUTPUT_DIR}/"
 
 echo "Generating JCM <-> rotated Gaussian lat-lon grid regridding weights ..."
 for method in "${WEIGHT_METHODS[@]}"; do
