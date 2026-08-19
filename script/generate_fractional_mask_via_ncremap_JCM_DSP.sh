@@ -25,7 +25,7 @@ set -euo pipefail
 set -x
 
 # --- inputs you may want to change ------------------------------------------
-ERA5_FILE=ERA5_landsea_mask.nc     # must have variable "lsm" on lat/lon
+ERA5_FILE=EarthSystemGrids/data/ERA5_landsea_mask.nc     # must have variables "lsm" and "z" on lat/lon
 OUTPUT_DIR=landsea_mask_data
 GRID_DIR=grid_data
 
