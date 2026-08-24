@@ -1,0 +1,362 @@
+import os
+
+import numpy as np
+import pytest
+import scipy.sparse
+import xarray as xr
+
+from EarthSystemGrids.base.UnstructuredGridMesh import UnstructuredGridMesh
+from EarthSystemGrids.domain_master import (
+    CoverageError,
+    DomainMaster,
+    _angle_trig,
+    _make_esmf_regridder,
+    check_coverage,
+)
+
+# These fixtures are produced by script/generate_fractional_mask_via_ncremap_JCM_RGLL.sh
+# (ncremap/ESMF_RegridWeightGen) and are gitignored (*.nc), not committed -- skip
+# gracefully rather than failing when they haven't been generated locally.
+_JCM_SCRIP = "grid_data/JCM_T31.SCRIP.nc"
+_RGLL_SCRIP = "grid_data/RotatedGaussianLatLon.SCRIP.nc"
+_JCM_TO_RGLL_CONSERVE = "grid_data/weight_algo-conserve_JCM_T31_to_RotatedGaussianLatLon.nc"
+_JCM_LANDSEA = "landsea_mask_data/landsea_mask_fraction_JCM_T31.nc"
+_RGLL_LANDSEA = "landsea_mask_data/landsea_mask_fraction_RotatedGaussianLatLon.nc"
+
+_FIXTURES = [_JCM_SCRIP, _RGLL_SCRIP, _JCM_TO_RGLL_CONSERVE, _JCM_LANDSEA, _RGLL_LANDSEA]
+_HAVE_FIXTURES = all(os.path.exists(p) for p in _FIXTURES)
+
+requires_fixtures = pytest.mark.skipif(
+    not _HAVE_FIXTURES,
+    reason=(
+        "requires grid_data/ and landsea_mask_data/ fixtures from "
+        "script/generate_fractional_mask_via_ncremap_JCM_RGLL.sh (gitignored, not committed)"
+    ),
+)
+
+
+# --- _make_esmf_regridder / flat-array adapter ------------------------------
+
+@requires_fixtures
+def test_regridder_indices_are_0_indexed_and_in_range():
+    from EarthSystemGrids.base.esmf_regrid import ESMFRegridder
+
+    r = ESMFRegridder(_JCM_TO_RGLL_CONSERVE)
+    w = r.weights
+    assert int(np.asarray(w.row_indices).min()) == 0
+    assert int(np.asarray(w.row_indices).max()) == w.dst_size - 1
+    assert int(np.asarray(w.col_indices).min()) == 0
+    assert int(np.asarray(w.col_indices).max()) == w.src_size - 1
+    assert w.src_size == 4608
+    assert w.dst_size == 16200
+
+
+@requires_fixtures
+def test_regridder_constant_field_stays_constant_where_fully_covered():
+    regridder = _make_esmf_regridder(_JCM_TO_RGLL_CONSERVE)
+    ones = np.ones(4608, dtype=np.float32)
+    out = np.asarray(regridder(ones))
+    assert not np.isnan(out).any()
+    np.testing.assert_allclose(out, 1.0, atol=1e-5)
+
+
+@requires_fixtures
+def test_regridder_matches_independent_scipy_reference():
+    regridder = _make_esmf_regridder(_JCM_TO_RGLL_CONSERVE)
+
+    with xr.open_dataset(_JCM_TO_RGLL_CONSERVE) as ds:
+        row = ds["row"].values - 1
+        col = ds["col"].values - 1
+        S = ds["S"].values
+        n_a = ds.sizes["n_a"]
+        n_b = ds.sizes["n_b"]
+
+    reference = scipy.sparse.coo_matrix((S, (row, col)), shape=(n_b, n_a)).tocsr()
+
+    rng = np.random.default_rng(0)
+    field = rng.random(n_a).astype(np.float64)
+
+    expected = reference @ field
+    actual = np.asarray(regridder(field))
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@requires_fixtures
+def test_regridder_zero_coverage_cell_is_nan():
+    # A destination index that never appears in `row` never receives any
+    # weight, so frac_b for it is 0 -- confirm the adapter NaNs it out.
+    with xr.open_dataset(_JCM_TO_RGLL_CONSERVE) as ds:
+        row = ds["row"].values - 1
+        frac_b = ds["frac_b"].values
+    covered = np.zeros(frac_b.shape[0], dtype=bool)
+    covered[row] = True
+    # sanity: this weight file, from two global full-sphere grids, should
+    # have every destination cell covered -- so cross-check against frac_b
+    # directly rather than assuming an uncovered cell exists.
+    assert np.array_equal(covered, frac_b > 0)
+
+    regridder = _make_esmf_regridder(_JCM_TO_RGLL_CONSERVE)
+    ones = np.ones(4608, dtype=np.float32)
+    out = np.asarray(regridder(ones))
+    zero_cov = np.flatnonzero(frac_b == 0)
+    if zero_cov.size:
+        assert np.isnan(out[zero_cov]).all()
+    else:
+        assert not np.isnan(out).any()
+
+
+# --- check_coverage (module-level, no DomainMaster needed) -----------------
+
+def test_check_coverage_detects_hole():
+    valid = np.ones(10, dtype=bool)
+    a = np.full(10, 1.0)
+    a[:3] = np.nan
+    b = np.full(10, 2.0)
+    b[:3] = np.nan
+    with pytest.raises(CoverageError):
+        check_coverage(valid, {"a": a, "b": b})
+
+
+def test_check_coverage_detects_overlap_by_default():
+    valid = np.ones(10, dtype=bool)
+    a = np.full(10, 1.0)
+    b = np.full(10, 2.0)  # fully overlaps a everywhere
+    with pytest.raises(CoverageError):
+        check_coverage(valid, {"a": a, "b": b})
+    report = check_coverage(valid, {"a": a, "b": b}, allow_overlap=True)
+    assert report.ok
+
+
+def test_check_coverage_passes_for_exact_partition():
+    valid = np.ones(10, dtype=bool)
+    a = np.full(10, 1.0)
+    a[5:] = np.nan
+    b = np.full(10, 2.0)
+    b[:5] = np.nan
+    report = check_coverage(valid, {"a": a, "b": b})
+    assert report.ok
+    assert not report.holes.any()
+    assert not report.overlaps.any()
+
+
+# --- DomainMaster ------------------------------------------------------------
+
+@requires_fixtures
+def test_register_domain_path_and_object_equivalent():
+    from EarthSystemGrids.base.StructuredQuadMesh import StructuredQuadMesh
+
+    dm = DomainMaster()
+    d_from_path = dm.register_domain("JCM_path", _JCM_SCRIP, _JCM_LANDSEA)
+
+    mesh = StructuredQuadMesh.from_SCRIP_file(_JCM_SCRIP)
+    with xr.open_dataset(_JCM_LANDSEA) as ds:
+        mask_arr = ds["lsm"].squeeze().values.reshape(-1)
+    d_from_object = dm.register_domain("JCM_object", mesh, mask_arr)
+
+    np.testing.assert_array_equal(d_from_path.landsea_mask, d_from_object.landsea_mask)
+    np.testing.assert_allclose(d_from_path.grid.face_lon, d_from_object.grid.face_lon)
+
+
+@requires_fixtures
+def test_register_domain_topography_from_same_file_as_landsea_mask():
+    dm = DomainMaster()
+    d = dm.register_domain(
+        "JCM", _JCM_SCRIP, _JCM_LANDSEA, topography=_JCM_LANDSEA,
+    )
+    with xr.open_dataset(_JCM_LANDSEA) as ds:
+        expected_mask = ds["lsm"].squeeze().values.reshape(-1)
+        expected_topo = ds["topography"].squeeze().values.reshape(-1)
+    np.testing.assert_array_equal(d.landsea_mask, expected_mask)
+    np.testing.assert_array_equal(d.topography, expected_topo)
+
+
+def _make_domain_master_with_domains():
+    dm = DomainMaster()
+    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, _RGLL_LANDSEA, is_exchange_grid=True)
+    return dm
+
+
+@requires_fixtures
+def test_exchange_grid_names():
+    dm = _make_domain_master_with_domains()
+    assert dm.exchange_grid_names == ["RGLL"]
+
+
+@requires_fixtures
+def test_register_transformation_lazy_loads_and_caches():
+    dm = _make_domain_master_with_domains()
+    t = dm.register_transformation(
+        "JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE
+    )
+    assert t.regridder is None
+
+    dm.transform_scalar("JCM", "RGLL", "conserve", np.ones(4608, dtype=np.float32))
+    built = t.regridder
+    assert built is not None
+
+    dm.transform_scalar("JCM", "RGLL", "conserve", np.ones(4608, dtype=np.float32))
+    assert t.regridder is built  # cached, not rebuilt
+
+
+@requires_fixtures
+def test_register_transformation_requires_registered_domains():
+    dm = DomainMaster()
+    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
+    with pytest.raises(ValueError):
+        dm.register_transformation("JCM", "nope", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+    with pytest.raises(ValueError):
+        dm.register_transformation("nope", "JCM", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+
+@requires_fixtures
+def test_register_transformation_requires_exactly_one_of_weight_file_or_regridder():
+    dm = DomainMaster()
+    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, _RGLL_LANDSEA)
+    with pytest.raises(ValueError):
+        dm.register_transformation("JCM", "RGLL", "conserve")
+    with pytest.raises(ValueError):
+        dm.register_transformation(
+            "JCM", "RGLL", "conserve",
+            weight_file=_JCM_TO_RGLL_CONSERVE, regridder=lambda f: f,
+        )
+
+
+@requires_fixtures
+def test_transform_scalar_unregistered_transformation_raises():
+    dm = _make_domain_master_with_domains()
+    with pytest.raises(KeyError):
+        dm.transform_scalar("JCM", "RGLL", "nope", np.zeros(4608))
+
+
+@requires_fixtures
+def test_transform_scalar_custom_regridder_used_directly():
+    dm = _make_domain_master_with_domains()
+    dm.register_transformation("JCM", "RGLL", "double", regridder=lambda f: 2.0 * np.asarray(f)[:5])
+    out = dm.transform_scalar("JCM", "RGLL", "double", np.arange(4608, dtype=np.float64))
+    np.testing.assert_array_equal(out, np.array([0.0, 2.0, 4.0, 6.0, 8.0]))
+
+
+@requires_fixtures
+def test_transform_scalar_conserve_end_to_end_constant_field():
+    dm = _make_domain_master_with_domains()
+    dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+    ones = np.ones(4608, dtype=np.float32)
+    out = np.asarray(dm.transform_scalar("JCM", "RGLL", "conserve", ones))
+    assert not np.isnan(out).any()
+    np.testing.assert_allclose(out, 1.0, atol=1e-5)
+
+
+@requires_fixtures
+def test_transform_scalar_conserve_is_area_conservative():
+    dm = _make_domain_master_with_domains()
+    dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+    with xr.open_dataset(_JCM_SCRIP) as ds:
+        src_area = ds["grid_area"].values
+    with xr.open_dataset(_RGLL_SCRIP) as ds:
+        dst_area = ds["grid_area"].values
+
+    rng = np.random.default_rng(0)
+    field = rng.random(4608).astype(np.float32)
+    out = np.asarray(dm.transform_scalar("JCM", "RGLL", "conserve", field))
+
+    src_integral = float(np.sum(field * src_area))
+    dst_integral = float(np.sum(out * dst_area))
+    rel_err = abs(dst_integral - src_integral) / abs(src_integral)
+    assert rel_err < 1e-4
+
+
+@requires_fixtures
+def test_transform_vector_matches_manual_rotation():
+    dm = _make_domain_master_with_domains()
+    dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+    rng = np.random.default_rng(1)
+    u = rng.random(4608).astype(np.float32)
+    v = rng.random(4608).astype(np.float32)
+
+    u_dst, v_dst = dm.transform_vector("JCM", "RGLL", "conserve", u, v)
+
+    cos_src, sin_src = _angle_trig(dm._domains["JCM"].grid)
+    cos_dst, sin_dst = _angle_trig(dm._domains["RGLL"].grid)
+    u_east = u * cos_src - v * sin_src
+    v_north = u * sin_src + v * cos_src
+    u_east_dst = np.asarray(dm.transform_scalar("JCM", "RGLL", "conserve", u_east))
+    v_north_dst = np.asarray(dm.transform_scalar("JCM", "RGLL", "conserve", v_north))
+    expected_u = u_east_dst * cos_dst + v_north_dst * sin_dst
+    expected_v = -u_east_dst * sin_dst + v_north_dst * cos_dst
+
+    np.testing.assert_allclose(np.asarray(u_dst), expected_u, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(v_dst), expected_v, atol=1e-5)
+
+
+@requires_fixtures
+def test_transform_vector_reduces_to_identity_for_identity_regridder_same_grid():
+    dm = DomainMaster()
+    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
+    dm.register_transformation("JCM", "JCM", "identity", regridder=lambda f: f)
+
+    rng = np.random.default_rng(2)
+    u = rng.random(4608)
+    v = rng.random(4608)
+    u_out, v_out = dm.transform_vector("JCM", "JCM", "identity", u, v)
+    # source == target -> the source->geographic and geographic->target
+    # rotations exactly cancel, so this must reduce to the identity.
+    np.testing.assert_allclose(np.asarray(u_out), u, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(v_out), v, atol=1e-10)
+
+
+@requires_fixtures
+def test_transform_vector_raises_for_non_structured_grid():
+    dm = _make_domain_master_with_domains()
+
+    jcm_mesh = dm._domains["JCM"].grid
+    lon = jcm_mesh.node_lon[:4]
+    lat = jcm_mesh.node_lat[:4]
+    face_corner_lon = np.array([[lon[0], lon[1], lon[2]], [lon[0], lon[2], lon[3]]])
+    face_corner_lat = np.array([[lat[0], lat[1], lat[2]], [lat[0], lat[2], lat[3]]])
+    face_lon = face_corner_lon.mean(axis=1)
+    face_lat = face_corner_lat.mean(axis=1)
+    poly_mesh = UnstructuredGridMesh.from_polygons(
+        face_corner_lon, face_corner_lat, face_lon, face_lat,
+        area=np.array([1.0, 1.0]), mask=np.array([1, 1]),
+    )
+    dm.register_domain("POLY", poly_mesh, np.array([0.5, 0.5]))
+    dm.register_transformation("JCM", "POLY", "nearest", regridder=lambda f: f[:2])
+
+    with pytest.raises(TypeError):
+        dm.transform_vector("JCM", "POLY", "nearest", np.zeros(4608), np.zeros(4608))
+
+
+@requires_fixtures
+def test_domain_master_check_coverage_detects_hole_and_overlap():
+    dm = _make_domain_master_with_domains()
+    n_b = dm._domains["RGLL"].grid.face_lon.size
+    valid = np.ones(n_b, dtype=bool)
+
+    a_with_hole = np.full(n_b, 1.0)
+    a_with_hole[:10] = np.nan
+    b_with_hole = np.full(n_b, 2.0)
+    b_with_hole[:10] = np.nan
+    with pytest.raises(CoverageError):
+        dm.check_coverage("RGLL", {"a": a_with_hole, "b": b_with_hole}, valid_mask=valid)
+
+    a_full = np.full(n_b, 1.0)
+    b_full = np.full(n_b, 2.0)
+    with pytest.raises(CoverageError):
+        dm.check_coverage("RGLL", {"a": a_full, "b": b_full}, valid_mask=valid)
+    report = dm.check_coverage(
+        "RGLL", {"a": a_full, "b": b_full}, valid_mask=valid, allow_overlap=True
+    )
+    assert report.ok
+
+
+@requires_fixtures
+def test_domain_master_check_coverage_default_valid_mask_from_grid_mask():
+    dm = _make_domain_master_with_domains()
+    n_b = dm._domains["RGLL"].grid.face_lon.size
+    contribution = np.full(n_b, 1.0)
+    report = dm.check_coverage("RGLL", {"only_source": contribution})
+    np.testing.assert_array_equal(report.valid_mask, dm._domains["RGLL"].grid.mask == 1)
