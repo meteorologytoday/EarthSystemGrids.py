@@ -1,10 +1,12 @@
 """
-Builds a flat-(nface,)-array regridder callable from a pre-generated ESMF
-weight file.
+Regridder-callable builders: a flat-(nface,)-array regridder from a
+pre-generated ESMF weight file, and a same-grid masking regridder for
+transformations that are really just a mask, not an interpolation.
 """
 
 from typing import Callable
 
+import numpy as np
 import xarray as xr
 
 
@@ -44,5 +46,72 @@ def _make_esmf_regridder(weight_file, *, frac_b_threshold: float = 0.0) -> Calla
             field_a[w.col_indices] * w.weights
         )
         return jnp.where(frac_b <= frac_b_threshold, jnp.nan, dst)
+
+    return regridder
+
+
+def make_mask_regridder(mask, fill_value: float = np.nan) -> Callable:
+    """
+    Build a same-grid "masking" regridder: field_a -> where(mask, field_a, fill_value).
+
+    For transformations where source and target share the same underlying
+    grid (e.g. splitting a shared exchange grid into separate ocean/land
+    views) -- no interpolation, just keeping the cells `mask` selects and
+    replacing the rest with `fill_value`. `mask` is typically a domain's
+    own `mask` field (1 = active, 0 = inactive; or any 0/1-or-bool array
+    the same size as the grid); truthy entries are kept, falsy entries
+    become `fill_value`.
+
+    `mask` may also be a zero-argument callable returning the mask array,
+    e.g. `lambda: dm.domains["ocn"].mask` -- resolved lazily, on the first
+    call to the returned regridder rather than at make_mask_regridder()
+    call time, and cached from then on. This lets a masking transformation
+    be registered (`register_transformation(..., regridder=make_mask_regridder(
+    lambda: dm.domains["ocn"].mask))`) before the domain it reads the mask
+    from has one set yet -- the same "declare now, resolve later" pattern
+    DomainMaster's own placeholder domains/transformations already follow.
+    A callable that still returns None (or raises, e.g. because the domain
+    isn't registered yet) only surfaces as an error at that first real
+    call -- transform_scalar/transform_vector, or validate()'s functional
+    check, not here.
+
+    `fill_value` defaults to NaN, matching the "not covered by this
+    source" convention check_coverage already reads (via each ESMF weight
+    file's frac_b) -- so a set of masking transformations built this way
+    (e.g. one per land/ocean view of a shared exchange grid) can be
+    checked directly with check_coverage to confirm the masks partition
+    the shared grid exactly, with no gaps or overlap.
+
+    Plain numpy, not jax -- unlike the ESMF weight-file regridder above,
+    nothing here runs inside a jax.jit/grad trace, so this keeps the
+    implementation simple rather than tracking jax array types through a
+    masking op that's normally cheap and eager.
+
+    Raises ValueError if a concrete (non-callable) `mask` is None -- e.g.
+    a domain's own `mask` field that was never set, passed directly rather
+    than via a lazy callable. Silently accepting None would otherwise turn
+    into a 0-d False mask that NaNs out every cell, which is exactly the
+    kind of silent, all-cells-empty bug this should fail loudly on
+    instead. A callable is exempt from this eager check by design -- that
+    is exactly the deferred-resolution case above.
+    """
+    if not callable(mask) and mask is None:
+        raise ValueError("make_mask_regridder needs a mask, got None")
+
+    resolved = {}
+
+    def _resolved_mask():
+        if "value" not in resolved:
+            m = mask() if callable(mask) else mask
+            if m is None:
+                raise ValueError("make_mask_regridder's mask callable returned None")
+            resolved["value"] = np.asarray(m).astype(bool)
+        return resolved["value"]
+
+    if not callable(mask):
+        _resolved_mask()  # eager: resolve (and cache) immediately, as before
+
+    def regridder(field_a):
+        return np.where(_resolved_mask(), np.asarray(field_a), fill_value)
 
     return regridder

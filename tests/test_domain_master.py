@@ -11,6 +11,7 @@ from EarthSystemGrids.domain_master import (
     DomainMaster,
     ValidationError,
     check_coverage,
+    make_mask_regridder,
 )
 from EarthSystemGrids.domain_master.domain_master import _angle_trig
 from EarthSystemGrids.domain_master.regrid import _make_esmf_regridder
@@ -147,34 +148,34 @@ def test_register_domain_path_and_object_equivalent():
     from EarthSystemGrids.base.StructuredQuadMesh import StructuredQuadMesh
 
     dm = DomainMaster()
-    d_from_path = dm.register_domain("JCM_path", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    d_from_path = dm.register_domain("JCM_path", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
 
     mesh = StructuredQuadMesh.from_SCRIP_file(_JCM_SCRIP)
     with xr.open_dataset(_JCM_LANDSEA) as ds:
         mask_arr = ds["lsm"].squeeze().values.reshape(-1)
-    d_from_object = dm.register_domain("JCM_object", grid=mesh, landsea_mask=mask_arr)
+    d_from_object = dm.register_domain("JCM_object", grid=mesh, land_fraction=mask_arr)
 
-    np.testing.assert_array_equal(d_from_path.landsea_mask, d_from_object.landsea_mask)
+    np.testing.assert_array_equal(d_from_path.land_fraction, d_from_object.land_fraction)
     np.testing.assert_allclose(d_from_path.grid.face_lon, d_from_object.grid.face_lon)
 
 
 @requires_fixtures
-def test_register_domain_topography_from_same_file_as_landsea_mask():
+def test_register_domain_topography_from_same_file_as_land_fraction():
     dm = DomainMaster()
     d = dm.register_domain(
-        "JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA, topography=_JCM_LANDSEA,
+        "JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA, topography=_JCM_LANDSEA,
     )
     with xr.open_dataset(_JCM_LANDSEA) as ds:
         expected_mask = ds["lsm"].squeeze().values.reshape(-1)
         expected_topo = ds["topography"].squeeze().values.reshape(-1)
-    np.testing.assert_array_equal(d.landsea_mask, expected_mask)
+    np.testing.assert_array_equal(d.land_fraction, expected_mask)
     np.testing.assert_array_equal(d.topography, expected_topo)
 
 
 def _make_domain_master_with_domains():
     dm = DomainMaster()
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", grid=_RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA, is_exchange_grid=True)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
+    dm.register_domain("RGLL", grid=_RGLL_SCRIP, land_fraction=_RGLL_LANDSEA, is_exchange_grid=True)
     return dm
 
 
@@ -207,7 +208,7 @@ def test_register_transformation_does_not_require_registered_domains():
     # the validate() tests below for where a still-dangling reference is
     # actually caught.
     dm = DomainMaster()
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
     dm.register_transformation("JCM", "nope", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
     dm.register_transformation("nope", "JCM", "conserve2", weight_file=_JCM_TO_RGLL_CONSERVE)
 
@@ -215,8 +216,8 @@ def test_register_transformation_does_not_require_registered_domains():
 @requires_fixtures
 def test_register_transformation_rejects_both_weight_file_and_regridder():
     dm = DomainMaster()
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", grid=_RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
+    dm.register_domain("RGLL", grid=_RGLL_SCRIP, land_fraction=_RGLL_LANDSEA)
     with pytest.raises(ValueError):
         dm.register_transformation(
             "JCM", "RGLL", "conserve",
@@ -230,8 +231,8 @@ def test_register_transformation_placeholder_lifecycle():
     # "declare the transformation graph now, fill in the mechanism later"
     # workflow.
     dm = DomainMaster()
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", grid=_RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
+    dm.register_domain("RGLL", grid=_RGLL_SCRIP, land_fraction=_RGLL_LANDSEA)
     dm.register_transformation("JCM", "RGLL", "conserve")
 
     t = next(iter(dm.transformations.values()))
@@ -329,7 +330,7 @@ def test_transform_vector_matches_manual_rotation():
 @requires_fixtures
 def test_transform_vector_reduces_to_identity_for_identity_regridder_same_grid():
     dm = DomainMaster()
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
     dm.register_transformation("JCM", "JCM", "identity", regridder=lambda f: f)
 
     rng = np.random.default_rng(2)
@@ -357,7 +358,7 @@ def test_transform_vector_raises_for_non_structured_grid():
         face_corner_lon, face_corner_lat, face_lon, face_lat,
         area=np.array([1.0, 1.0]), mask=np.array([1, 1]),
     )
-    dm.register_domain("POLY", grid=poly_mesh, landsea_mask=np.array([0.5, 0.5]))
+    dm.register_domain("POLY", grid=poly_mesh, land_fraction=np.array([0.5, 0.5]))
     dm.register_transformation("JCM", "POLY", "nearest", regridder=lambda f: f[:2])
 
     with pytest.raises(TypeError):
@@ -407,8 +408,8 @@ def test_register_transformation_before_domains_exist_does_not_raise():
     )
     assert t.source == "JCM" and t.target == "RGLL"
 
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", grid=_RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
+    dm.register_domain("RGLL", grid=_RGLL_SCRIP, land_fraction=_RGLL_LANDSEA)
 
     # now resolvable
     out = dm.transform_scalar("JCM", "RGLL", "conserve", np.ones(4608, dtype=np.float32))
@@ -420,7 +421,7 @@ def test_repr_lists_domains_and_flags_missing_transformation():
     dm = DomainMaster()
     if not _HAVE_FIXTURES:
         pytest.skip("requires fixtures")
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
     dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
 
     text = repr(dm)
@@ -447,11 +448,11 @@ def test_domains_and_transformations_properties_are_read_only_views():
     with pytest.raises(TypeError):
         dm.transformations[("a", "b", "c")] = None
 
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", grid=_RGLL_SCRIP)  # landsea_mask left unset
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
+    dm.register_domain("RGLL", grid=_RGLL_SCRIP)  # land_fraction left unset
 
-    assert dm.domains["JCM"].landsea_mask is not None
-    assert dm.domains["RGLL"].landsea_mask is None
+    assert dm.domains["JCM"].land_fraction is not None
+    assert dm.domains["RGLL"].land_fraction is None
     assert type(dm.domains["JCM"].grid).__name__ == "StructuredQuadMesh"
     assert dm.domains["JCM"].grid.face_lon.size == 4608
 
@@ -472,8 +473,8 @@ def test_validate_raises_for_dangling_reference_then_passes_once_resolved():
     assert len(problems) == 1
     assert "JCM" in problems[0] and "not registered" in problems[0]
 
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", grid=_RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
+    dm.register_domain("RGLL", grid=_RGLL_SCRIP, land_fraction=_RGLL_LANDSEA)
     assert dm.validate(raise_error=False) == []
     dm.validate()  # does not raise
 
@@ -510,15 +511,15 @@ def test_register_domain_name_only_is_a_placeholder():
     dm = DomainMaster()
     d = dm.register_domain("atm")
     assert d.grid is None
-    assert d.landsea_mask is None
+    assert d.land_fraction is None
     assert d.topography is None
     assert dm.domains["atm"] is d
 
 
-def test_register_domain_rejects_landsea_mask_without_grid():
+def test_register_domain_rejects_land_fraction_without_grid():
     dm = DomainMaster()
     with pytest.raises(ValueError):
-        dm.register_domain("atm", landsea_mask=np.array([0.5]))
+        dm.register_domain("atm", land_fraction=np.array([0.5]))
 
 
 @requires_fixtures
@@ -527,7 +528,7 @@ def test_register_domain_placeholder_filled_in_without_overwrite():
     dm.register_domain("JCM", is_exchange_grid=True)
     assert dm.domains["JCM"].grid is None
 
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
     assert dm.domains["JCM"].grid is not None
     assert dm.domains["JCM"].grid.face_lon.size == 4608
     # filling in a placeholder doesn't carry over the placeholder call's
@@ -566,7 +567,7 @@ def test_validate_catches_placeholder_domain_referenced_by_transformation():
 @requires_fixtures
 def test_transform_vector_raises_clearly_for_domain_with_no_grid():
     dm = DomainMaster()
-    dm.register_domain("JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA)
     dm.register_domain("ocn")
     dm.register_transformation("JCM", "ocn", "bilinear", regridder=lambda f: f)
 
@@ -582,37 +583,106 @@ def test_check_coverage_raises_clearly_when_exchange_domain_has_no_grid():
         dm.check_coverage("ocn", {"a": np.zeros(10)})
 
 
-# --- binary_landsea_mask ------------------------------------------------------
+# --- mask ---------------------------------------------------------------
 
 @requires_fixtures
-def test_register_domain_binary_landsea_mask_independent_of_fractional():
+def test_register_domain_mask_independent_of_land_fraction():
     dm = DomainMaster()
     binary = np.zeros(4608, dtype=int)
     binary[::2] = 1
     d = dm.register_domain(
-        "JCM", grid=_JCM_SCRIP, landsea_mask=_JCM_LANDSEA, binary_landsea_mask=binary,
+        "JCM", grid=_JCM_SCRIP, land_fraction=_JCM_LANDSEA, mask=binary,
     )
-    np.testing.assert_array_equal(d.binary_landsea_mask, binary)
-    assert d.landsea_mask is not None  # unaffected by/independent of binary_landsea_mask
+    np.testing.assert_array_equal(d.mask, binary)
+    assert d.land_fraction is not None  # unaffected by/independent of mask
 
-    # landsea_mask omitted, binary given -- still independent
+    # land_fraction omitted, mask given -- still independent
     dm2 = DomainMaster()
-    d2 = dm2.register_domain("RGLL", grid=_RGLL_SCRIP, binary_landsea_mask=np.ones(16200, dtype=int))
-    assert d2.landsea_mask is None
-    assert d2.binary_landsea_mask is not None
+    d2 = dm2.register_domain("RGLL", grid=_RGLL_SCRIP, mask=np.ones(16200, dtype=int))
+    assert d2.land_fraction is None
+    assert d2.mask is not None
 
 
-def test_register_domain_rejects_binary_landsea_mask_without_grid():
+def test_register_domain_rejects_mask_without_grid():
     dm = DomainMaster()
     with pytest.raises(ValueError):
-        dm.register_domain("atm", binary_landsea_mask=np.array([1, 0]))
+        dm.register_domain("atm", mask=np.array([1, 0]))
 
 
-def test_repr_shows_binary_landsea_mask():
+def test_repr_shows_mask():
     dm = DomainMaster()
     if not _HAVE_FIXTURES:
         pytest.skip("requires fixtures")
-    dm.register_domain("JCM", grid=_JCM_SCRIP, binary_landsea_mask=np.zeros(4608, dtype=int))
+    dm.register_domain("JCM", grid=_JCM_SCRIP, mask=np.zeros(4608, dtype=int))
     text = repr(dm)
-    assert "binary_landsea_mask=yes" in text
-    assert "landsea_mask=no" in text
+    assert "mask=yes" in text
+    assert "land_fraction=no" in text
+
+
+# --- make_mask_regridder ------------------------------------------------------
+
+def test_make_mask_regridder_rejects_none_mask():
+    # A domain whose mask was never set (Domain.mask is None) must fail
+    # loudly here, not silently build a regridder that NaNs out every cell.
+    with pytest.raises(ValueError):
+        make_mask_regridder(None)
+
+
+def test_make_mask_regridder_keeps_selected_cells_and_fills_the_rest():
+    mask = np.array([True, False, True, False])
+    regridder = make_mask_regridder(mask)
+    out = regridder(np.array([1.0, 2.0, 3.0, 4.0]))
+    np.testing.assert_array_equal(out[[0, 2]], [1.0, 3.0])
+    assert np.isnan(out[1]) and np.isnan(out[3])
+
+
+def test_make_mask_regridder_lazy_callable_defers_resolution():
+    # No error yet -- the callable hasn't been invoked.
+    box = {"mask": None}
+    regridder = make_mask_regridder(lambda: box["mask"])
+
+    # Still None when the regridder is actually used -> raises there, not earlier.
+    with pytest.raises(ValueError):
+        regridder(np.array([1.0, 2.0]))
+
+    # Filled in later -- now resolves correctly (matches the "declare now,
+    # resolve later" pattern DomainMaster's own placeholders follow).
+    box["mask"] = np.array([True, False])
+    out = regridder(np.array([1.0, 2.0]))
+    assert out[0] == 1.0 and np.isnan(out[1])
+
+
+def test_make_mask_regridder_lazy_callable_caches_after_first_resolution():
+    box = {"mask": np.array([True, False])}
+    regridder = make_mask_regridder(lambda: box["mask"])
+    first = regridder(np.array([1.0, 2.0]))
+
+    # Changing the underlying mask afterward must NOT affect subsequent
+    # calls -- resolved once, cached, per the "cache once" design.
+    box["mask"] = np.array([False, True])
+    second = regridder(np.array([1.0, 2.0]))
+    np.testing.assert_array_equal(first, second)
+
+
+def test_make_mask_regridder_custom_fill_value():
+    mask = np.array([1, 0, 1], dtype=int)
+    regridder = make_mask_regridder(mask, fill_value=0.0)
+    out = regridder(np.array([5.0, 6.0, 7.0]))
+    np.testing.assert_array_equal(out, [5.0, 0.0, 7.0])
+
+
+def test_make_mask_regridder_partitioning_masks_pass_check_coverage():
+    # Complementary masks (e.g. an ocean view and a land view of the same
+    # shared exchange grid) should partition it exactly -- no holes, no
+    # overlap -- exactly what check_coverage is for.
+    n = 10
+    ocean_mask = np.zeros(n, dtype=bool)
+    ocean_mask[:6] = True
+    land_mask = ~ocean_mask
+
+    field = np.arange(n, dtype=float)
+    ocean_view = make_mask_regridder(ocean_mask)(field)
+    land_view = make_mask_regridder(land_mask)(field)
+
+    report = check_coverage(np.ones(n, dtype=bool), {"ocn": ocean_view, "lnd": land_view})
+    assert report.ok

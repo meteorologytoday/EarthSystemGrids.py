@@ -16,6 +16,7 @@ working unchanged.
 
 from EarthSystemGrids.domain_master.coverage import CoverageError, CoverageReport, check_coverage
 from EarthSystemGrids.domain_master.domain_master import DomainMaster, ValidationError
+from EarthSystemGrids.domain_master.regrid import make_mask_regridder
 from EarthSystemGrids.domain_master.types import Domain, Transformation
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "check_coverage",
     "DomainMaster",
     "ValidationError",
+    "make_mask_regridder",
 ]

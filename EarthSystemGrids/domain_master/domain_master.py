@@ -61,46 +61,46 @@ class DomainMaster:
         name: str,
         *,
         grid=None,
-        landsea_mask=None,
-        binary_landsea_mask=None,
+        land_fraction=None,
+        mask=None,
         topography=None,
         is_exchange_grid: bool = False,
-        landsea_mask_var: str = "lsm",
-        binary_landsea_mask_var: str = "binary_landsea_mask",
+        land_fraction_var: str = "lsm",
+        mask_var: str = "mask",
         topography_var: str = "topography",
         grid_format: Optional[str] = None,
         overwrite: bool = False,
         attrs: Optional[dict] = None,
     ) -> Domain:
         """
-        Register a named domain. `grid`/`landsea_mask`/`binary_landsea_mask`/
+        Register a named domain. `grid`/`land_fraction`/`mask`/
         `topography` may each be an already-constructed object (a mesh
         instance; an array-like) or a file path to load (a SCRIP/CF grid
-        file; a netCDF file with a `landsea_mask_var`/
-        `binary_landsea_mask_var`/`topography_var` variable). Passing the
-        same path to more than one of these works correctly -- each pulls
-        its own named variable -- which fits the landsea_mask_data/ files
-        this repo's own scripts already produce.
+        file; a netCDF file with a `land_fraction_var`/`mask_var`/
+        `topography_var` variable). Passing the same path to more than one
+        of these works correctly -- each pulls its own named variable --
+        which fits the landsea_mask_data/ files this repo's own scripts
+        already produce.
 
-        `landsea_mask` is the fractional mask (e.g. ocean fraction 0..1);
-        `binary_landsea_mask` is an independent, separately-provided hard
-        land/sea decision -- not derived from `landsea_mask`, and not the
-        same thing as the mesh's own structural grid.mask (used for
-        `grid_imask`/coverage's default valid_mask). Give whichever of the
-        two masks you actually need; either, both, or neither is fine.
+        `land_fraction` is the fractional land/sea split (e.g. ocean
+        fraction 0..1); `mask` is an independent, separately-provided
+        binary field (1 = active, 0 = inactive) -- not derived from
+        `land_fraction`, and not the same thing as the mesh's own
+        structural grid.mask (used for `grid_imask`/coverage's default
+        valid_mask). Give whichever of the two you actually need; either,
+        both, or neither is fine.
 
         `grid` may also be omitted entirely -- register_domain(name) alone
         declares a placeholder domain (just the name) to be filled in
         later by calling register_domain again with the same name and a
         grid this time (allowed without overwrite=True as long as the
         existing entry is still a placeholder; overwrite=True is required
-        to replace an already-resolved domain). landsea_mask/
-        binary_landsea_mask/topography can't be given without a grid in
-        the same call -- there's no face count yet to default/validate
-        them against. Each call fully specifies the domain's state;
-        filling in a placeholder later doesn't carry over
-        is_exchange_grid/attrs from the placeholder call -- repeat them if
-        still wanted.
+        to replace an already-resolved domain). land_fraction/mask/
+        topography can't be given without a grid in the same call --
+        there's no face count yet to default/validate them against. Each
+        call fully specifies the domain's state; filling in a placeholder
+        later doesn't carry over is_exchange_grid/attrs from the
+        placeholder call -- repeat them if still wanted.
         """
         existing = self._domains.get(name)
         existing_is_resolved = existing is not None and existing.grid is not None
@@ -110,9 +110,9 @@ class DomainMaster:
             )
 
         if grid is None:
-            if landsea_mask is not None or binary_landsea_mask is not None or topography is not None:
+            if land_fraction is not None or mask is not None or topography is not None:
                 raise ValueError(
-                    f"domain {name!r}: landsea_mask/binary_landsea_mask/topography can't be "
+                    f"domain {name!r}: land_fraction/mask/topography can't be "
                     "set without a grid (there's no face count yet to validate/default them "
                     "against) -- pass grid= in this same call, or register it first"
                 )
@@ -138,17 +138,15 @@ class DomainMaster:
                 )
             return value
 
-        landsea_mask_arr = _resolve_field(landsea_mask, landsea_mask_var, "landsea_mask")
-        binary_landsea_mask_arr = _resolve_field(
-            binary_landsea_mask, binary_landsea_mask_var, "binary_landsea_mask"
-        )
+        land_fraction_arr = _resolve_field(land_fraction, land_fraction_var, "land_fraction")
+        mask_arr = _resolve_field(mask, mask_var, "mask")
         topography_arr = _resolve_field(topography, topography_var, "topography")
 
         domain = Domain(
             name=name,
             grid=grid,
-            landsea_mask=landsea_mask_arr,
-            binary_landsea_mask=binary_landsea_mask_arr,
+            land_fraction=land_fraction_arr,
+            mask=mask_arr,
             topography=topography_arr,
             is_exchange_grid=is_exchange_grid,
             attrs=dict(attrs or {}),
@@ -335,8 +333,8 @@ class DomainMaster:
             grid_desc += f" shape={tuple(shape)}" if shape is not None else f" nface={d.grid.face_lon.size}"
             lines.append(
                 f"  domain {d.name!r}{tag}: grid={grid_desc}, "
-                f"landsea_mask={'yes' if d.landsea_mask is not None else 'no'}, "
-                f"binary_landsea_mask={'yes' if d.binary_landsea_mask is not None else 'no'}, "
+                f"land_fraction={'yes' if d.land_fraction is not None else 'no'}, "
+                f"mask={'yes' if d.mask is not None else 'no'}, "
                 f"topography={'yes' if d.topography is not None else 'no'}"
             )
         for t in transformations:

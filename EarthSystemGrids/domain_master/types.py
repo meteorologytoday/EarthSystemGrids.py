@@ -16,8 +16,8 @@ from EarthSystemGrids.base.UnstructuredGridMesh import UnstructuredGridMesh
 class Domain:
     name: str
     grid: Optional[UnstructuredGridMesh] = None   # None -- a placeholder, name declared but not yet resolved
-    landsea_mask: Optional[np.ndarray] = None      # fractional (e.g. ocean fraction 0..1); always None while grid is None
-    binary_landsea_mask: Optional[np.ndarray] = None  # hard land/sea decision, independent of the fractional mask above
+    land_fraction: Optional[np.ndarray] = None  # fractional (e.g. ocean fraction 0..1); always None while grid is None
+    mask: Optional[np.ndarray] = None              # 1 = active, 0 = inactive; independent of land_fraction above
     topography: Optional[np.ndarray] = None
     is_exchange_grid: bool = False
     attrs: dict = field(default_factory=dict)
