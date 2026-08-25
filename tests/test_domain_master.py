@@ -448,10 +448,10 @@ def test_domains_and_transformations_properties_are_read_only_views():
         dm.transformations[("a", "b", "c")] = None
 
     dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
-    dm.register_domain("RGLL", _RGLL_SCRIP)  # landsea_mask left to default
+    dm.register_domain("RGLL", _RGLL_SCRIP)  # landsea_mask left unset
 
-    assert dm.domains["JCM"].attrs["landsea_mask_provided"] is True
-    assert dm.domains["RGLL"].attrs["landsea_mask_provided"] is False
+    assert dm.domains["JCM"].landsea_mask is not None
+    assert dm.domains["RGLL"].landsea_mask is None
     assert type(dm.domains["JCM"].grid).__name__ == "StructuredQuadMesh"
     assert dm.domains["JCM"].grid.face_lon.size == 4608
 

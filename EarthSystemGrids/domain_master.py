@@ -302,13 +302,9 @@ class DomainMaster:
             grid = _load_grid(grid, grid_format=grid_format)
         nface = grid.face_lon.size
 
-        def _resolve_field(value, var_name, label, default_value=None):
+        def _resolve_field(value, var_name, label):
             if value is None:
-                if default_value is None:
-                    return None
-                else:
-                    value = np.asarray([default_value] * nface)
-
+                return None
             if isinstance(value, (str, os.PathLike)):
                 value = _load_field(value, var_name)
             else:
@@ -320,15 +316,8 @@ class DomainMaster:
                 )
             return value
 
-        landsea_mask_arr = _resolve_field(landsea_mask, landsea_mask_var, "landsea_mask", default_value=0.0)
+        landsea_mask_arr = _resolve_field(landsea_mask, landsea_mask_var, "landsea_mask")
         topography_arr = _resolve_field(topography, topography_var, "topography")
-
-        domain_attrs = dict(attrs or {})
-        # landsea_mask is never None on a resolved Domain (it defaults to
-        # all-zero), so __repr__ needs this to tell "really provided" from
-        # "defaulted" -- part of registering a domain before all its pieces
-        # are on hand.
-        domain_attrs.setdefault("landsea_mask_provided", landsea_mask is not None)
 
         domain = Domain(
             name=name,
@@ -336,7 +325,7 @@ class DomainMaster:
             landsea_mask=landsea_mask_arr,
             topography=topography_arr,
             is_exchange_grid=is_exchange_grid,
-            attrs=domain_attrs,
+            attrs=dict(attrs or {}),
         )
         self._domains[name] = domain
         return domain
@@ -518,10 +507,9 @@ class DomainMaster:
             shape = getattr(d.grid, "shape", None)
             grid_desc = type(d.grid).__name__
             grid_desc += f" shape={tuple(shape)}" if shape is not None else f" nface={d.grid.face_lon.size}"
-            landsea_mask_provided = bool(d.attrs.get("landsea_mask_provided", True))
             lines.append(
                 f"  domain {d.name!r}{tag}: grid={grid_desc}, "
-                f"landsea_mask={'provided' if landsea_mask_provided else 'default (zero)'}, "
+                f"landsea_mask={'yes' if d.landsea_mask is not None else 'no'}, "
                 f"topography={'yes' if d.topography is not None else 'no'}"
             )
         for t in transformations:
