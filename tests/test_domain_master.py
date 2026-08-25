@@ -9,6 +9,7 @@ from EarthSystemGrids.base.UnstructuredGridMesh import UnstructuredGridMesh
 from EarthSystemGrids.domain_master import (
     CoverageError,
     DomainMaster,
+    ValidationError,
     _angle_trig,
     _make_esmf_regridder,
     check_coverage,
@@ -146,12 +147,12 @@ def test_register_domain_path_and_object_equivalent():
     from EarthSystemGrids.base.StructuredQuadMesh import StructuredQuadMesh
 
     dm = DomainMaster()
-    d_from_path = dm.register_domain("JCM_path", _JCM_SCRIP, _JCM_LANDSEA)
+    d_from_path = dm.register_domain("JCM_path", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
 
     mesh = StructuredQuadMesh.from_SCRIP_file(_JCM_SCRIP)
     with xr.open_dataset(_JCM_LANDSEA) as ds:
         mask_arr = ds["lsm"].squeeze().values.reshape(-1)
-    d_from_object = dm.register_domain("JCM_object", mesh, mask_arr)
+    d_from_object = dm.register_domain("JCM_object", mesh, landsea_mask=mask_arr)
 
     np.testing.assert_array_equal(d_from_path.landsea_mask, d_from_object.landsea_mask)
     np.testing.assert_allclose(d_from_path.grid.face_lon, d_from_object.grid.face_lon)
@@ -161,7 +162,7 @@ def test_register_domain_path_and_object_equivalent():
 def test_register_domain_topography_from_same_file_as_landsea_mask():
     dm = DomainMaster()
     d = dm.register_domain(
-        "JCM", _JCM_SCRIP, _JCM_LANDSEA, topography=_JCM_LANDSEA,
+        "JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA, topography=_JCM_LANDSEA,
     )
     with xr.open_dataset(_JCM_LANDSEA) as ds:
         expected_mask = ds["lsm"].squeeze().values.reshape(-1)
@@ -172,8 +173,8 @@ def test_register_domain_topography_from_same_file_as_landsea_mask():
 
 def _make_domain_master_with_domains():
     dm = DomainMaster()
-    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
-    dm.register_domain("RGLL", _RGLL_SCRIP, _RGLL_LANDSEA, is_exchange_grid=True)
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA, is_exchange_grid=True)
     return dm
 
 
@@ -200,27 +201,60 @@ def test_register_transformation_lazy_loads_and_caches():
 
 
 @requires_fixtures
-def test_register_transformation_requires_registered_domains():
+def test_register_transformation_does_not_require_registered_domains():
+    # Registration is lazy: source/target don't need to exist yet -- see
+    # test_register_transformation_before_domains_exist_does_not_raise and
+    # the validate() tests below for where a still-dangling reference is
+    # actually caught.
     dm = DomainMaster()
-    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
-    with pytest.raises(ValueError):
-        dm.register_transformation("JCM", "nope", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
-    with pytest.raises(ValueError):
-        dm.register_transformation("nope", "JCM", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_transformation("JCM", "nope", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+    dm.register_transformation("nope", "JCM", "conserve2", weight_file=_JCM_TO_RGLL_CONSERVE)
 
 
 @requires_fixtures
-def test_register_transformation_requires_exactly_one_of_weight_file_or_regridder():
+def test_register_transformation_rejects_both_weight_file_and_regridder():
     dm = DomainMaster()
-    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
-    dm.register_domain("RGLL", _RGLL_SCRIP, _RGLL_LANDSEA)
-    with pytest.raises(ValueError):
-        dm.register_transformation("JCM", "RGLL", "conserve")
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
     with pytest.raises(ValueError):
         dm.register_transformation(
             "JCM", "RGLL", "conserve",
             weight_file=_JCM_TO_RGLL_CONSERVE, regridder=lambda f: f,
         )
+
+
+@requires_fixtures
+def test_register_transformation_placeholder_lifecycle():
+    # Neither weight_file nor regridder registers a placeholder -- the
+    # "declare the transformation graph now, fill in the mechanism later"
+    # workflow.
+    dm = DomainMaster()
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+    dm.register_transformation("JCM", "RGLL", "conserve")
+
+    t = next(iter(dm.transformations.values()))
+    assert t.weight_file is None and t.regridder is None
+    with pytest.raises(ValueError):
+        dm.transform_scalar("JCM", "RGLL", "conserve", np.ones(4608))
+    problems = dm.validate(raise_error=False)
+    assert len(problems) == 1 and "placeholder" in problems[0]
+
+    # filling in a placeholder doesn't need overwrite=True
+    dm.register_transformation(
+        "JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE
+    )
+    assert dm.validate(raise_error=False) == []
+
+    # but re-registering an already-resolved transformation still does
+    with pytest.raises(ValueError):
+        dm.register_transformation("JCM", "RGLL", "conserve", regridder=lambda f: f)
+    dm.register_transformation(
+        "JCM", "RGLL", "conserve", regridder=lambda f: f, overwrite=True
+    )
+    t = next(iter(dm.transformations.values()))
+    assert t.weight_file is None and t.regridder is not None
 
 
 @requires_fixtures
@@ -295,7 +329,7 @@ def test_transform_vector_matches_manual_rotation():
 @requires_fixtures
 def test_transform_vector_reduces_to_identity_for_identity_regridder_same_grid():
     dm = DomainMaster()
-    dm.register_domain("JCM", _JCM_SCRIP, _JCM_LANDSEA)
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
     dm.register_transformation("JCM", "JCM", "identity", regridder=lambda f: f)
 
     rng = np.random.default_rng(2)
@@ -323,7 +357,7 @@ def test_transform_vector_raises_for_non_structured_grid():
         face_corner_lon, face_corner_lat, face_lon, face_lat,
         area=np.array([1.0, 1.0]), mask=np.array([1, 1]),
     )
-    dm.register_domain("POLY", poly_mesh, np.array([0.5, 0.5]))
+    dm.register_domain("POLY", poly_mesh, landsea_mask=np.array([0.5, 0.5]))
     dm.register_transformation("JCM", "POLY", "nearest", regridder=lambda f: f[:2])
 
     with pytest.raises(TypeError):
@@ -360,3 +394,189 @@ def test_domain_master_check_coverage_default_valid_mask_from_grid_mask():
     contribution = np.full(n_b, 1.0)
     report = dm.check_coverage("RGLL", {"only_source": contribution})
     np.testing.assert_array_equal(report.valid_mask, dm._domains["RGLL"].grid.mask == 1)
+
+
+# --- lazy registration, inspection, and validation --------------------------
+
+@requires_fixtures
+def test_register_transformation_before_domains_exist_does_not_raise():
+    dm = DomainMaster()
+    # neither "JCM" nor "RGLL" is registered yet
+    t = dm.register_transformation(
+        "JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE
+    )
+    assert t.source == "JCM" and t.target == "RGLL"
+
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+
+    # now resolvable
+    out = dm.transform_scalar("JCM", "RGLL", "conserve", np.ones(4608, dtype=np.float32))
+    assert np.asarray(out).shape == (16200,)
+    assert dm.validate(raise_error=False) == []
+
+
+def test_repr_lists_domains_and_flags_missing_transformation():
+    dm = DomainMaster()
+    if not _HAVE_FIXTURES:
+        pytest.skip("requires fixtures")
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+    text = repr(dm)
+    assert "'JCM'" in text
+    assert "MISSING" in text
+    assert "target 'RGLL' not registered" in text
+    # print(dm) exercises __str__, which should delegate to __repr__
+    assert str(dm) == text
+
+
+@requires_fixtures
+def test_domains_and_transformations_properties_are_read_only_views():
+    dm = DomainMaster()
+    dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+    assert dm.domains == {}
+    assert list(dm.transformations.keys()) == [("JCM", "RGLL", "conserve")]
+    t = dm.transformations[("JCM", "RGLL", "conserve")]
+    assert t.source == "JCM" and t.target == "RGLL" and t.method == "conserve"
+    assert t.weight_file == _JCM_TO_RGLL_CONSERVE
+    assert t.regridder is None  # not built yet
+    with pytest.raises(TypeError):
+        dm.domains["hack"] = None
+    with pytest.raises(TypeError):
+        dm.transformations[("a", "b", "c")] = None
+
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP)  # landsea_mask left to default
+
+    assert dm.domains["JCM"].attrs["landsea_mask_provided"] is True
+    assert dm.domains["RGLL"].attrs["landsea_mask_provided"] is False
+    assert type(dm.domains["JCM"].grid).__name__ == "StructuredQuadMesh"
+    assert dm.domains["JCM"].grid.face_lon.size == 4608
+
+    assert dm.transformations[("JCM", "RGLL", "conserve")].regridder is None
+
+    dm.transform_scalar("JCM", "RGLL", "conserve", np.ones(4608, dtype=np.float32))
+    assert dm.transformations[("JCM", "RGLL", "conserve")].regridder is not None
+
+
+@requires_fixtures
+def test_validate_raises_for_dangling_reference_then_passes_once_resolved():
+    dm = DomainMaster()
+    dm.register_transformation("JCM", "RGLL", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+    with pytest.raises(ValidationError):
+        dm.validate()
+    problems = dm.validate(raise_error=False)
+    assert len(problems) == 1
+    assert "JCM" in problems[0] and "not registered" in problems[0]
+
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("RGLL", _RGLL_SCRIP, landsea_mask=_RGLL_LANDSEA)
+    assert dm.validate(raise_error=False) == []
+    dm.validate()  # does not raise
+
+
+@requires_fixtures
+def test_validate_catches_weight_file_domain_size_mismatch():
+    dm = DomainMaster()
+    # Both "A" and "B" are JCM-sized (4608), but the registered weight file
+    # is JCM (4608) -> RGLL (16200) -- a genuine size mismatch on the target.
+    dm.register_domain("A", _JCM_SCRIP)
+    dm.register_domain("B", _JCM_SCRIP)
+    dm.register_transformation("A", "B", "conserve", weight_file=_JCM_TO_RGLL_CONSERVE)
+
+    problems = dm.validate(raise_error=False)
+    assert len(problems) == 1
+    assert "does not match target domain" in problems[0]
+    with pytest.raises(ValidationError):
+        dm.validate()
+
+
+@requires_fixtures
+def test_validate_catches_custom_regridder_wrong_output_size():
+    dm = _make_domain_master_with_domains()
+    dm.register_transformation("JCM", "RGLL", "bad", regridder=lambda f: np.asarray(f)[:5])
+
+    problems = dm.validate(raise_error=False)
+    assert len(problems) == 1
+    assert "does not match target domain" in problems[0]
+
+
+# --- lazy grid registration --------------------------------------------------
+
+def test_register_domain_name_only_is_a_placeholder():
+    dm = DomainMaster()
+    d = dm.register_domain("atm")
+    assert d.grid is None
+    assert d.landsea_mask is None
+    assert d.topography is None
+    assert dm.domains["atm"] is d
+
+
+def test_register_domain_rejects_landsea_mask_without_grid():
+    dm = DomainMaster()
+    with pytest.raises(ValueError):
+        dm.register_domain("atm", landsea_mask=np.array([0.5]))
+
+
+@requires_fixtures
+def test_register_domain_placeholder_filled_in_without_overwrite():
+    dm = DomainMaster()
+    dm.register_domain("JCM", is_exchange_grid=True)
+    assert dm.domains["JCM"].grid is None
+
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    assert dm.domains["JCM"].grid is not None
+    assert dm.domains["JCM"].grid.face_lon.size == 4608
+    # filling in a placeholder doesn't carry over the placeholder call's
+    # is_exchange_grid -- each register_domain call fully specifies state
+    assert dm.domains["JCM"].is_exchange_grid is False
+
+    # but re-registering the now-resolved domain still needs overwrite=True
+    with pytest.raises(ValueError):
+        dm.register_domain("JCM", _JCM_SCRIP)
+    dm.register_domain("JCM", _JCM_SCRIP, overwrite=True)
+
+
+def test_repr_flags_placeholder_domain_and_dependent_transformation():
+    dm = DomainMaster()
+    dm.register_domain("atm")
+    dm.register_domain("ocn")
+    dm.register_transformation("atm", "ocn", "bilinear")
+
+    text = repr(dm)
+    assert "domain 'atm': UNRESOLVED (no grid set yet)" in text
+    assert "source 'atm' has no grid set yet" in text
+    assert "target 'ocn' has no grid set yet" in text
+
+
+def test_validate_catches_placeholder_domain_referenced_by_transformation():
+    dm = DomainMaster()
+    dm.register_domain("atm")
+    dm.register_domain("ocn")
+    dm.register_transformation("atm", "ocn", "bilinear", regridder=lambda f: f)
+
+    problems = dm.validate(raise_error=False)
+    assert len(problems) == 1
+    assert "atm" in problems[0] and "no grid set yet" in problems[0]
+
+
+@requires_fixtures
+def test_transform_vector_raises_clearly_for_domain_with_no_grid():
+    dm = DomainMaster()
+    dm.register_domain("JCM", _JCM_SCRIP, landsea_mask=_JCM_LANDSEA)
+    dm.register_domain("ocn")
+    dm.register_transformation("JCM", "ocn", "bilinear", regridder=lambda f: f)
+
+    with pytest.raises(TypeError, match="no grid set yet"):
+        dm.transform_vector("JCM", "ocn", "bilinear", np.zeros(4608), np.zeros(4608))
+
+
+@requires_fixtures
+def test_check_coverage_raises_clearly_when_exchange_domain_has_no_grid():
+    dm = DomainMaster()
+    dm.register_domain("ocn")
+    with pytest.raises(ValueError, match="no grid set yet"):
+        dm.check_coverage("ocn", {"a": np.zeros(10)})

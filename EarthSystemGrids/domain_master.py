@@ -10,7 +10,8 @@ shared exchange grid.
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from types import MappingProxyType
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import xarray as xr
@@ -22,8 +23,8 @@ from EarthSystemGrids.base.UnstructuredGridMesh import UnstructuredGridMesh
 @dataclass
 class Domain:
     name: str
-    grid: UnstructuredGridMesh
-    landsea_mask: np.ndarray
+    grid: Optional[UnstructuredGridMesh] = None   # None -- a placeholder, name declared but not yet resolved
+    landsea_mask: Optional[np.ndarray] = None      # always None while grid is None (no face count to default/validate against)
     topography: Optional[np.ndarray] = None
     is_exchange_grid: bool = False
     attrs: dict = field(default_factory=dict)
@@ -44,6 +45,15 @@ class CoverageError(Exception):
     regridded onto an exchange grid leaves holes (uncovered valid cells)
     or, if allow_overlap=False, overlaps (a valid cell covered by more
     than one source).
+    """
+
+
+class ValidationError(Exception):
+    """
+    Raised by DomainMaster.validate() when the registered domains and
+    transformations aren't internally consistent -- a transformation
+    referencing a domain that was never registered, or one whose regridder
+    doesn't actually map source-sized fields to target-sized ones.
     """
 
 
@@ -225,12 +235,22 @@ class DomainMaster:
     def exchange_grid_names(self) -> List[str]:
         return [name for name, d in self._domains.items() if d.is_exchange_grid]
 
+    @property
+    def domains(self) -> Mapping[str, Domain]:
+        """Read-only view of registered domains, keyed by name."""
+        return MappingProxyType(self._domains)
+
+    @property
+    def transformations(self) -> Mapping[Tuple[str, str, str], Transformation]:
+        """Read-only view of registered transformations, keyed by (source, target, method)."""
+        return MappingProxyType(self._transformations)
+
     def register_domain(
         self,
         name: str,
-        grid,
-        landsea_mask,
+        grid=None,
         *,
+        landsea_mask=None,
         topography=None,
         is_exchange_grid: bool = False,
         landsea_mask_var: str = "lsm",
@@ -247,19 +267,48 @@ class DomainMaster:
         Passing the same path to both landsea_mask= and topography= works
         correctly -- each pulls its own named variable -- which fits the
         landsea_mask_data/ files this repo's own scripts already produce.
+
+        `grid` may also be omitted entirely -- register_domain(name) alone
+        declares a placeholder domain (just the name) to be filled in
+        later by calling register_domain again with the same name and a
+        grid this time (allowed without overwrite=True as long as the
+        existing entry is still a placeholder; overwrite=True is required
+        to replace an already-resolved domain). landsea_mask/topography
+        can't be given without a grid in the same call -- there's no face
+        count yet to default/validate them against. Each call fully
+        specifies the domain's state; filling in a placeholder later
+        doesn't carry over is_exchange_grid/attrs from the placeholder
+        call -- repeat them if still wanted.
         """
-        if name in self._domains and not overwrite:
+        existing = self._domains.get(name)
+        existing_is_resolved = existing is not None and existing.grid is not None
+        if existing is not None and existing_is_resolved and not overwrite:
             raise ValueError(
                 f"domain {name!r} is already registered (pass overwrite=True to replace it)"
             )
+
+        if grid is None:
+            if landsea_mask is not None or topography is not None:
+                raise ValueError(
+                    f"domain {name!r}: landsea_mask/topography can't be set without a grid "
+                    "(there's no face count yet to validate/default them against) -- "
+                    "pass grid= in this same call, or register it first"
+                )
+            domain = Domain(name=name, is_exchange_grid=is_exchange_grid, attrs=dict(attrs or {}))
+            self._domains[name] = domain
+            return domain
 
         if not _is_mesh(grid):
             grid = _load_grid(grid, grid_format=grid_format)
         nface = grid.face_lon.size
 
-        def _resolve_field(value, var_name, label):
+        def _resolve_field(value, var_name, label, default_value=None):
             if value is None:
-                return None
+                if default_value is None:
+                    return None
+                else:
+                    value = np.asarray([default_value] * nface)
+
             if isinstance(value, (str, os.PathLike)):
                 value = _load_field(value, var_name)
             else:
@@ -271,8 +320,15 @@ class DomainMaster:
                 )
             return value
 
-        landsea_mask_arr = _resolve_field(landsea_mask, landsea_mask_var, "landsea_mask")
+        landsea_mask_arr = _resolve_field(landsea_mask, landsea_mask_var, "landsea_mask", default_value=0.0)
         topography_arr = _resolve_field(topography, topography_var, "topography")
+
+        domain_attrs = dict(attrs or {})
+        # landsea_mask is never None on a resolved Domain (it defaults to
+        # all-zero), so __repr__ needs this to tell "really provided" from
+        # "defaulted" -- part of registering a domain before all its pieces
+        # are on hand.
+        domain_attrs.setdefault("landsea_mask_provided", landsea_mask is not None)
 
         domain = Domain(
             name=name,
@@ -280,7 +336,7 @@ class DomainMaster:
             landsea_mask=landsea_mask_arr,
             topography=topography_arr,
             is_exchange_grid=is_exchange_grid,
-            attrs=attrs or {},
+            attrs=domain_attrs,
         )
         self._domains[name] = domain
         return domain
@@ -296,24 +352,41 @@ class DomainMaster:
         overwrite: bool = False,
     ) -> Transformation:
         """
-        Register a regridding transformation between two already-registered
-        domains, labeled by `method` (e.g. "conserve", "bilinear").
-        Exactly one of `weight_file` (a pre-generated ESMF weight file --
-        DomainMaster never generates weights itself) or `regridder` (a
-        plain callable field_a -> field_b, for anything ESMF weights
-        aren't the right tool for) must be given.
+        Register a regridding transformation between two domains, labeled
+        by `method` (e.g. "conserve", "bilinear"). At most one of
+        `weight_file` (a pre-generated ESMF weight file -- DomainMaster
+        never generates weights itself) or `regridder` (a plain callable
+        field_a -> field_b, for anything ESMF weights aren't the right
+        tool for) may be given -- giving both is ambiguous and rejected.
+        Giving neither registers a placeholder (source/target/method
+        declared, regridding mechanism still to be filled in later by
+        calling register_transformation again with the same source/target/
+        method and a weight_file or regridder this time -- allowed without
+        overwrite=True as long as the existing entry is still a
+        placeholder; overwrite=True is required to replace an already
+        resolved one).
+
+        `source`/`target` don't need to already be registered domains --
+        transformations can be registered before, after, or interleaved
+        with the domains they reference, so a DomainMaster can be built up
+        incrementally. A still-dangling reference, or a still-unresolved
+        placeholder, is only an error once something actually needs it:
+        transform_scalar/transform_vector (which look the domain/regridder
+        up directly), or the explicit validate(). __repr__/summary() flag
+        both so they're visible without waiting for one of those.
         """
-        if source not in self._domains:
-            raise ValueError(f"unknown source domain {source!r} -- register it first")
-        if target not in self._domains:
-            raise ValueError(f"unknown target domain {target!r} -- register it first")
-        if (weight_file is None) == (regridder is None):
+        if weight_file is not None and regridder is not None:
             raise ValueError(
-                "register_transformation needs exactly one of weight_file or regridder"
+                "register_transformation takes at most one of weight_file or regridder "
+                "(got both) -- pass neither to register a placeholder to fill in later"
             )
 
         key = (source, target, method)
-        if key in self._transformations and not overwrite:
+        existing = self._transformations.get(key)
+        existing_is_resolved = existing is not None and (
+            existing.weight_file is not None or existing.regridder is not None
+        )
+        if existing is not None and existing_is_resolved and not overwrite:
             raise ValueError(
                 f"transformation {source!r} -> {target!r} (method={method!r}) is already "
                 "registered (pass overwrite=True to replace it)"
@@ -334,6 +407,12 @@ class DomainMaster:
             )
         transformation = self._transformations[key]
         if transformation.regridder is None:
+            if transformation.weight_file is None:
+                raise ValueError(
+                    f"transformation {source!r} -> {target!r} (method={method!r}) is still "
+                    "a placeholder -- call register_transformation again with the same "
+                    "source/target/method and a weight_file= or regridder= to fill it in"
+                )
             transformation.regridder = _make_esmf_regridder(transformation.weight_file)
         return transformation.regridder
 
@@ -365,6 +444,11 @@ class DomainMaster:
         src_mesh = self._domains[source].grid
         dst_mesh = self._domains[target].grid
         for domain_name, mesh in ((source, src_mesh), (target, dst_mesh)):
+            if mesh is None:
+                raise TypeError(
+                    f"domain {domain_name!r} has no grid set yet -- register_domain(...) "
+                    "needs a grid= before transform_vector can use it"
+                )
             if not hasattr(mesh, "rotation_angle"):
                 raise TypeError(
                     f"transform_vector needs a StructuredQuadMesh-family grid (a "
@@ -402,7 +486,125 @@ class DomainMaster:
         """
         domain = self._domains[exchange_domain]
         if valid_mask is None:
+            if domain.grid is None:
+                raise ValueError(
+                    f"domain {exchange_domain!r} has no grid set yet -- either register_domain(...) "
+                    "with a grid= first, or pass valid_mask= explicitly"
+                )
             valid_mask = domain.grid.mask == 1
         return check_coverage(
             valid_mask, contributions, allow_overlap=allow_overlap, raise_error=raise_error
         )
+
+    def __repr__(self) -> str:
+        """
+        Quick-glance dump of everything currently registered -- for
+        crafting a DomainMaster incrementally: register what you have,
+        print(dm) to see what's there (and what's still dangling), then
+        validate()/check_coverage() once ready. For programmatic
+        inspection, use the `domains`/`transformations` properties
+        directly rather than parsing this text.
+        """
+        domains = list(self._domains.values())
+        transformations = list(self._transformations.values())
+        lines = [
+            f"DomainMaster({len(domains)} domain(s), {len(transformations)} transformation(s))"
+        ]
+        for d in domains:
+            tag = " [exchange]" if d.is_exchange_grid else ""
+            if d.grid is None:
+                lines.append(f"  domain {d.name!r}{tag}: UNRESOLVED (no grid set yet)")
+                continue
+            shape = getattr(d.grid, "shape", None)
+            grid_desc = type(d.grid).__name__
+            grid_desc += f" shape={tuple(shape)}" if shape is not None else f" nface={d.grid.face_lon.size}"
+            landsea_mask_provided = bool(d.attrs.get("landsea_mask_provided", True))
+            lines.append(
+                f"  domain {d.name!r}{tag}: grid={grid_desc}, "
+                f"landsea_mask={'provided' if landsea_mask_provided else 'default (zero)'}, "
+                f"topography={'yes' if d.topography is not None else 'no'}"
+            )
+        for t in transformations:
+            if t.weight_file is not None:
+                desc = f"weight_file={t.weight_file!r}"
+                desc += " (built)" if t.regridder is not None else " (not built yet)"
+            elif t.regridder is not None:
+                desc = "custom regridder"
+            else:
+                desc = "UNRESOLVED (no weight_file or regridder set yet)"
+            missing = []
+            if t.source not in self._domains:
+                missing.append(f"source {t.source!r} not registered")
+            elif self._domains[t.source].grid is None:
+                missing.append(f"source {t.source!r} has no grid set yet")
+            if t.target not in self._domains:
+                missing.append(f"target {t.target!r} not registered")
+            elif self._domains[t.target].grid is None:
+                missing.append(f"target {t.target!r} has no grid set yet")
+            warn = f" -- MISSING: {', '.join(missing)}" if missing else ""
+            lines.append(
+                f"  transformation {t.source!r} -> {t.target!r} (method={t.method!r}): "
+                f"{desc}{warn}"
+            )
+        return "\n".join(lines)
+
+    def validate(self, *, raise_error: bool = True) -> List[str]:
+        """
+        Check that every registered transformation's source/target refer to
+        registered domains (exactly what lazy registration defers), and
+        that its regridder actually maps a source-domain-sized field to a
+        target-domain-sized one -- checked functionally, by calling it on a
+        zero-filled dummy field, so this works uniformly whether the
+        transformation is ESMF-weight-file-backed or a custom regridder=
+        callable. This also builds+caches any not-yet-built weight_file
+        regridder, surfacing a malformed weight file here rather than
+        silently at first real transform_scalar/transform_vector call.
+
+        Returns the list of problems found (empty if none). Raises
+        ValidationError (joining them) if raise_error=True (the default)
+        and any were found. This is a broader "is my registered graph
+        consistent" check than check_coverage, which is specifically about
+        hole/overlap on an exchange grid.
+        """
+        problems: List[str] = []
+        for (source, target, method), t in self._transformations.items():
+            label = f"transformation {source!r} -> {target!r} (method={method!r})"
+            if source not in self._domains:
+                problems.append(f"{label}: source domain {source!r} is not registered")
+                continue
+            if target not in self._domains:
+                problems.append(f"{label}: target domain {target!r} is not registered")
+                continue
+            if self._domains[source].grid is None:
+                problems.append(f"{label}: source domain {source!r} has no grid set yet")
+                continue
+            if self._domains[target].grid is None:
+                problems.append(f"{label}: target domain {target!r} has no grid set yet")
+                continue
+            if t.weight_file is None and t.regridder is None:
+                problems.append(f"{label}: still a placeholder -- no weight_file or regridder set yet")
+                continue
+
+            try:
+                regridder = self._get_regridder(source, target, method)
+            except Exception as e:
+                problems.append(f"{label}: failed to build regridder: {e}")
+                continue
+
+            src_nface = self._domains[source].grid.face_lon.size
+            dst_nface = self._domains[target].grid.face_lon.size
+            try:
+                dummy = np.zeros(src_nface, dtype=np.float64)
+                result = np.asarray(regridder(dummy))
+            except Exception as e:
+                problems.append(f"{label}: regridder raised {e!r} on a zero test field")
+                continue
+            if result.shape[-1] != dst_nface:
+                problems.append(
+                    f"{label}: regridder output size {result.shape[-1]} does not match "
+                    f"target domain {target!r}'s size {dst_nface}"
+                )
+
+        if raise_error and problems:
+            raise ValidationError("; ".join(problems))
+        return problems
