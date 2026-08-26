@@ -41,6 +41,23 @@ def equally_spaced_bounds(n: int, lo: float, hi: float):
     return np.linspace(lo, hi, n + 1)
 
 
+def offset_equally_spaced_bounds(n: int, lo: float, hi: float):
+    """
+    n+1 cell-FACE values over [lo, hi], shifted by half a step relative to
+    `equally_spaced_bounds`: [lo, lo+step/2, lo+3*step/2, ..., hi-step/2, hi]
+    where step=(hi-lo)/(n-1). The two outermost cells are half-width (step/2);
+    all interior cells are full-width (step). Interior cell centers land on
+    lo, lo+step, lo+2*step, ..., hi (as opposed to `equally_spaced_bounds`,
+    whose centers are offset by step/2 from lo/hi).
+
+    E.g. offset_equally_spaced_bounds(91, -90, 90) ->
+    [-90, -89, -87, -85, ..., 85, 87, 89, 90] (step=2).
+    """
+    step = (hi - lo) / (n - 1)
+    interior = np.linspace(lo + step / 2, hi - step / 2, n - 1)
+    return np.concatenate([[lo], interior, [hi]])
+
+
 def bounds_from_centers(centers, clamp=None):
     """
     Cell-edge values bisecting between consecutive centres, for any
@@ -66,7 +83,7 @@ def bounds_from_centers(centers, clamp=None):
     return np.concatenate([[lo], midpoints, [hi]])
 
 
-def generate_mesh(lat, lon, mask=None, earth_radius: float = _R_EARTH,
+def generate_mesh(lat_bounds, lon_bounds, mask=None, earth_radius: float = _R_EARTH,
                   attrs=None) -> StructuredQuadMesh:
     """
     Build a lat-lon StructuredQuadMesh from explicit cell-FACE (boundary)
@@ -80,10 +97,10 @@ def generate_mesh(lat, lon, mask=None, earth_radius: float = _R_EARTH,
 
     Parameters
     ----------
-    lat : array-like of nlat+1 latitude FACE values in degrees (ascending).
+    lat_bounds : array-like of nlat+1 latitude FACE values in degrees (ascending).
         See `gaussian_latitude_bounds` for the standard Gaussian-grid
         spacing, or supply any other monotonically increasing boundary set.
-    lon : array-like of nlon+1 longitude FACE values in degrees (ascending).
+    lon_bounds : array-like of nlon+1 longitude FACE values in degrees (ascending).
         See `equally_spaced_bounds` for the standard uniform spacing.
     mask : (nlat, nlon) int, optional. 0=land 1=ocean. Defaults to all
         ocean; see EarthSystemGrids.base.apply_ocean_mask to fill this in
@@ -96,8 +113,8 @@ def generate_mesh(lat, lon, mask=None, earth_radius: float = _R_EARTH,
     -------
     StructuredQuadMesh, shape (nlat, nlon)
     """
-    lat_bounds = np.deg2rad(np.asarray(lat, dtype=float))
-    lon_bounds = np.deg2rad(np.asarray(lon, dtype=float))
+    lat_bounds = np.deg2rad(np.asarray(lat_bounds, dtype=float))
+    lon_bounds = np.deg2rad(np.asarray(lon_bounds, dtype=float))
     nlat, nlon = lat_bounds.size - 1, lon_bounds.size - 1
 
     # centres are the plain angular midpoint of each pair of adjacent

@@ -71,8 +71,8 @@ def generate_JCMGrid(resolution: int, mask=None, earth_radius: float = _R_EARTH,
     grid_attrs.update(attrs or {})
 
     return GaussianLatLon.generate_mesh(
-        lat          = lat_bounds_deg,
-        lon          = lon_bounds_deg,
+        lat_bounds   = lat_bounds_deg,
+        lon_bounds   = lon_bounds_deg,
         mask         = mask,
         earth_radius = earth_radius,
         attrs        = grid_attrs,
